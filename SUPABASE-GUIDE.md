@@ -1,0 +1,128 @@
+# Supabase Setup — FinAnalytics
+
+โปรเจกต์เตรียม Supabase Auth, PostgreSQL, Row Level Security และ Audit Log ไว้แล้ว  
+ถ้ายังไม่มี `.env` แอปจะทำงานใน Demo Mode และเก็บข้อมูลใน browser เท่านั้น
+
+## 1. สร้าง Supabase Project
+
+1. สร้างโปรเจกต์ที่ https://supabase.com
+2. เปิด **SQL Editor**
+3. รันไฟล์ `supabase/migrations/202606200001_initial_schema.sql` ทั้งไฟล์หนึ่งครั้ง
+
+Migration จะสร้าง:
+
+- `profiles`
+- `companies`
+- `company_members`
+- `financial_records`
+- `exchange_rates`
+- `audit_log`
+- RLS policies ทุกตาราง
+- Audit triggers
+- RPC สำหรับให้และถอนสิทธิ์บริษัท
+
+## 2. ตั้งค่า Environment
+
+คัดลอก `.env.example` เป็น `.env`:
+
+```env
+VITE_SUPABASE_URL=https://YOUR_PROJECT.supabase.co
+VITE_SUPABASE_PUBLISHABLE_KEY=sb_publishable_YOUR_KEY
+```
+
+หา URL และ Publishable key ได้ใน **Project Settings → API Keys**
+
+ใช้ Publishable/anon key เท่านั้น ห้ามนำ `service_role` key มาใส่ในเว็บ
+
+หลังแก้ `.env` ให้ตรวจและเปิด development server ใหม่:
+
+```bash
+npm run doctor:supabase
+npm run dev
+```
+### หมายเหตุสำคัญสำหรับ Vite + Vercel
+
+- ตัวแปรที่ frontend อ่านได้ต้องขึ้นต้นด้วย `VITE_`
+- ถ้า deploy ผ่าน Vercel ต้องเพิ่ม Environment Variables ใน Vercel ไม่ใช่อัปโหลด `.env` เข้า GitHub
+- หลังเพิ่มหรือแก้ Environment Variables ต้อง Redeploy ใหม่
+- ถ้ายังขึ้น Demo Mode ให้รัน `npm run doctor:supabase` ในเครื่องเพื่อตรวจชื่อ env ก่อน
+- โค้ดรองรับทั้ง `VITE_SUPABASE_PUBLISHABLE_KEY` และ `VITE_SUPABASE_ANON_KEY`
+
+
+## 3. Authentication
+
+หน้าเว็บรองรับ:
+
+- สมัครด้วย Email/Password
+- Login
+- Reset password
+- Sign out
+
+Supabase hosted projects เปิดการยืนยันอีเมลเป็นค่าเริ่มต้น ผู้ใช้จึงอาจต้องกดลิงก์ในอีเมลก่อน Login
+
+สำหรับ production ควรตั้งค่า:
+
+- Authentication → URL Configuration → Site URL
+- Redirect URLs สำหรับ localhost และโดเมนจริง
+- Custom SMTP เพราะบริการอีเมลเริ่มต้นเหมาะกับการทดลองเท่านั้น
+
+## 4. บริษัทแรกและสิทธิ์
+
+หลังผู้ใช้คนแรก Login:
+
+1. แอปจะแสดงหน้าสร้างบริษัทแรก
+2. ผู้สร้างจะเป็น `owner` อัตโนมัติ
+3. ไปหน้า **สิทธิ์ผู้ใช้**
+4. เพิ่มผู้ใช้ด้วยอีเมลและเลือกบทบาท
+
+ผู้รับสิทธิ์ต้องสมัครบัญชีแล้วก่อน
+
+บทบาท:
+
+| Role | สิทธิ์ |
+|---|---|
+| owner | จัดการทุกอย่างและให้สิทธิ์ Owner |
+| admin | จัดการสมาชิก, FX และข้อมูล |
+| editor | เพิ่มและแก้ไขข้อมูลการเงิน |
+| viewer | ดูข้อมูลเท่านั้น |
+
+## 5. Row Level Security
+
+RLS ถูกเปิดทุกตารางที่เปิดผ่าน API:
+
+- ผู้ใช้เห็นเฉพาะบริษัทที่เป็นสมาชิก
+- Editor ขึ้นไปจึงเขียนข้อมูลการเงินได้
+- Admin/Owner จัดการสมาชิกและอัตราแลกเปลี่ยนได้
+- Audit log เขียนได้เฉพาะ database trigger
+- Publishable key เพียงอย่างเดียวไม่สามารถข้าม RLS
+
+## 6. Audit Log
+
+Database trigger บันทึก `INSERT`, `UPDATE`, `DELETE` ของ:
+
+- companies
+- company_members
+- financial_records
+- exchange_rates
+
+บันทึกทั้งข้อมูลก่อน/หลัง ผู้ใช้ อีเมล เวลา และบริษัทที่เกี่ยวข้อง
+
+## 7. ตรวจระบบ
+
+```bash
+npm run check
+```
+
+คำสั่งนี้รัน automated tests และ production build
+
+## 8. Deployment
+
+ตั้ง Environment Variables สองตัวเดียวกับ `.env` บน Vercel/Netlify แล้วเพิ่ม URL จริงใน Supabase Redirect URLs
+
+ก่อนเปิด production:
+
+- ทดลองบัญชี Viewer ว่าเขียนข้อมูลไม่ได้
+- ทดลอง Editor ว่าแก้ข้อมูลได้ แต่จัดการสมาชิกไม่ได้
+- ทดลอง Admin/Owner
+- ตรวจ Audit Log
+- ตั้ง Custom SMTP และ backup policy
