@@ -175,3 +175,10 @@ Key changes:
 - If the selected sidebar year has no imported data, the Data Table falls back to the latest available year and displays a warning.
 - After a successful import, the selected year is updated to the imported primary fiscal year.
 
+
+## v1.4 Statement Insight UI
+
+- เพิ่มชุดกราฟแนว Stock analysis: Growth & Profitability, Profit Bridge, Financial Stability, Financial Position Analysis, Dividend History
+- เพิ่ม Detailed Financial Statement browser แยกงบกำไรขาดทุน / งบฐานะการเงิน / กระแสเงินสด
+- ปรับสีกราฟไม่ให้มีแท่งสีดำเป็นตัวนำ โดยใช้ Asset = Blue, Liability = Red, Equity/Profit/Cash Flow = Green/Accent ตาม theme
+- ยังอ่านข้อมูลจาก normalized_financial_data ผ่าน store เดิม ไม่ต้องรัน migration ใหม่
