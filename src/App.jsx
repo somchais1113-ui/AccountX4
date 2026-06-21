@@ -57,6 +57,72 @@ const INDUSTRIES = {
 };
 
 // DATA ENGINE
+const METRIC_GROUPS = {
+  revenue: [
+    "revenue", "sales_revenue", "healthcare_patient_revenue", "product_sales_revenue",
+    "real_estate_sales_revenue", "bank_net_interest_income", "bank_interest_income",
+    "bank_net_fee_income", "bank_fee_income", "other_income"
+  ],
+  expense: [
+    "expense", "cogs", "sga", "healthcare_service_cost", "real_estate_cogs",
+    "finance_cost", "tax", "bank_interest_expense", "bank_expected_credit_loss",
+    "bank_other_operating_expenses"
+  ],
+  netProfit: ["net_profit"],
+  cash: ["cash", "cash_ending", "cash_beginning"],
+  asset: ["asset"],
+  liability: ["liability"],
+  equity: ["equity"],
+  loan: ["loan", "bank_borrowings", "borrowings"],
+  cogs: ["cogs", "healthcare_service_cost", "real_estate_cogs"],
+  sga: ["sga", "bank_other_operating_expenses"],
+  operatingCashFlow: ["operating_cash_flow"],
+  investingCashFlow: ["investing_cash_flow"],
+  financingCashFlow: ["financing_cash_flow"],
+};
+
+const num = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
+const firstMetric = (groups = {}, keys = []) => {
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(groups, key)) return num(groups[key]);
+  }
+  return 0;
+};
+const sumMetrics = (groups = {}, keys = []) => keys.reduce((sum, key) => sum + num(groups[key]), 0);
+const deriveAnnualMetrics = (groups = {}) => {
+  const revenue = firstMetric(groups, ["revenue"]) || sumMetrics(groups, METRIC_GROUPS.revenue.filter(k => k !== "revenue"));
+  const cogs = sumMetrics(groups, METRIC_GROUPS.cogs);
+  const sga = sumMetrics(groups, METRIC_GROUPS.sga);
+  const expense = firstMetric(groups, ["expense"]) || sumMetrics(groups, METRIC_GROUPS.expense.filter(k => k !== "expense"));
+  const netProfit = firstMetric(groups, METRIC_GROUPS.netProfit) || (revenue ? revenue - expense : 0);
+  const cash = firstMetric(groups, METRIC_GROUPS.cash);
+  const asset = firstMetric(groups, METRIC_GROUPS.asset);
+  const liability = firstMetric(groups, METRIC_GROUPS.liability);
+  const equity = firstMetric(groups, METRIC_GROUPS.equity);
+  const loan = firstMetric(groups, METRIC_GROUPS.loan);
+  const cfo = firstMetric(groups, METRIC_GROUPS.operatingCashFlow);
+  const cfi = firstMetric(groups, METRIC_GROUPS.investingCashFlow);
+  const cff = firstMetric(groups, METRIC_GROUPS.financingCashFlow);
+  return {
+    revenue,
+    cogs,
+    sga,
+    expense,
+    netProfit,
+    cash,
+    asset,
+    liability,
+    equity,
+    loan,
+    operatingCashFlow: cfo,
+    investingCashFlow: cfi,
+    financingCashFlow: cff,
+    cashIn: cfo > 0 ? cfo : 0,
+    cashOut: cfo < 0 ? Math.abs(cfo) : 0,
+    margin: revenue ? (netProfit / revenue) * 100 : 0,
+  };
+};
+
 const DataEngine = {
   getYearData(store, companyId, year) {
     const yearData = store?.[companyId]?.[year] || {};
@@ -69,18 +135,21 @@ const DataEngine = {
 
     // Normalized Supabase shape: { FY: { groups: {...} }, Q1: ... }
     const period = yearData.FY || Object.values(yearData).find((record) => record?.groups);
-    const groups = period?.groups || {};
+    if (!period?.groups) return MONTHS.map((month, idx) => ({ monthIdx: idx, monthTh: month.th, monthEn: month.en, revenue: 0, expense: 0, cashIn: 0, cashOut: 0, loanBalance: 0, margin: 0, groups: {} }));
+    const groups = period.groups || {};
+    const metrics = deriveAnnualMetrics(groups);
     const annualRow = {
       monthIdx: 0,
       monthTh: "FY",
       monthEn: "FY",
-      revenue: groups.revenue || 0,
-      expense: groups.expense || (groups.cogs || 0) + (groups.sga || 0),
-      cashIn: groups.operating_cash_flow > 0 ? groups.operating_cash_flow : 0,
-      cashOut: groups.operating_cash_flow < 0 ? Math.abs(groups.operating_cash_flow) : 0,
-      loanBalance: groups.loan || 0,
-      margin: groups.revenue > 0 ? ((groups.net_profit || 0) / groups.revenue) : 0,
+      revenue: metrics.revenue,
+      expense: metrics.expense,
+      cashIn: metrics.cashIn,
+      cashOut: metrics.cashOut,
+      loanBalance: metrics.loan,
+      margin: metrics.margin,
       groups,
+      annualMetrics: metrics,
     };
 
     // Keep older monthly pages from crashing by returning 12 rows.
@@ -90,7 +159,31 @@ const DataEngine = {
       : { monthIdx: idx, monthTh: month.th, monthEn: month.en, revenue: 0, expense: 0, cashIn: 0, cashOut: 0, loanBalance: 0, margin: 0, groups: {} }
     );
   },
-  getAvailableYears(store, companyId) { return Object.keys(store?.[companyId]||{}).map(Number).sort(); },
+  getAvailableYears(store, companyId) { return Object.keys(store?.[companyId]||{}).map(Number).filter(Boolean).sort(); },
+  getDisplayYear(store, companyId, requestedYear) {
+    const years = this.getAvailableYears(store, companyId);
+    if (!years.length) return requestedYear;
+    if (years.includes(Number(requestedYear))) return Number(requestedYear);
+    return years[years.length - 1];
+  },
+  getAnnualPeriod(store, companyId, year) {
+    const yearData = store?.[companyId]?.[year] || {};
+    return yearData.FY || Object.values(yearData).find((record) => record?.groups) || null;
+  },
+  hasNormalizedAnnualData(store, companyId, year) {
+    return Boolean(this.getAnnualPeriod(store, companyId, year)?.groups);
+  },
+  getAnnualMetrics(store, companyId, year) {
+    const period = this.getAnnualPeriod(store, companyId, year);
+    const groups = period?.groups || {};
+    return { year, groups, ...deriveAnnualMetrics(groups) };
+  },
+  getAnnualRows(store, companyId) {
+    return this.getAvailableYears(store, companyId)
+      .filter((recordYear) => this.hasNormalizedAnnualData(store, companyId, recordYear))
+      .sort((a, b) => b - a)
+      .map((recordYear) => this.getAnnualMetrics(store, companyId, recordYear));
+  },
   countMonths(store, companyId, year) {
     const yearData = store?.[companyId]?.[year] || {};
     const legacyCount = Object.values(yearData).filter((record) => Number.isInteger(record?.monthIdx)).length;
@@ -362,8 +455,118 @@ function DataManagerPage({store, companyId, year, lang}) {
   const C = useC();
   const th = lang==="th";
   const company = COMPANIES.find(c=>c.id===companyId);
-  const data = DataEngine.getYearData(store, companyId, year);
   const years = DataEngine.getAvailableYears(store, companyId);
+  const displayYear = DataEngine.getDisplayYear(store, companyId, year);
+  const data = DataEngine.getYearData(store, companyId, displayYear);
+  const annualRows = DataEngine.getAnnualRows(store, companyId);
+  const hasAnnualData = annualRows.length > 0;
+  const isYearFallback = years.length > 0 && Number(year) !== Number(displayYear);
+  const selectedMetrics = DataEngine.getAnnualMetrics(store, companyId, displayYear);
+
+  const MetricCard = ({label, value, color}) => (
+    <Card style={{padding:16}}>
+      <div style={{fontSize:12,color:C.muted,fontWeight:700,marginBottom:8,textTransform:"uppercase",letterSpacing:"0.04em"}}>{label}</div>
+      <div style={{fontSize:19,fontWeight:900,color:color||C.text}}>{fmt(value, company.currency, true)}</div>
+    </Card>
+  );
+
+  if (hasAnnualData) {
+    const annualColumns = [
+      { key: 'year', th: 'ปี', en: 'Year', align: 'left' },
+      { key: 'revenue', th: 'รายได้', en: 'Revenue', color: C.green },
+      { key: 'expense', th: 'ค่าใช้จ่าย', en: 'Expense', color: C.red },
+      { key: 'netProfit', th: 'กำไรสุทธิ', en: 'Net Profit', color: C.accent },
+      { key: 'cash', th: 'เงินสด', en: 'Cash', color: C.text },
+      { key: 'asset', th: 'สินทรัพย์', en: 'Assets', color: C.text },
+      { key: 'liability', th: 'หนี้สิน', en: 'Liabilities', color: C.amber },
+      { key: 'equity', th: 'ส่วนทุน', en: 'Equity', color: C.purple },
+      { key: 'operatingCashFlow', th: 'CFO', en: 'CFO', color: C.green },
+      { key: 'investingCashFlow', th: 'CFI', en: 'CFI', color: C.text },
+      { key: 'financingCashFlow', th: 'CFF', en: 'CFF', color: C.text },
+    ];
+
+    return (
+      <div>
+        <PageHeader
+          title={th?"ตารางข้อมูล":"Data Table"}
+          subtitle={`${th?company.nameTh:company.nameEn} · ${company.currency} · ${th?"ปีที่มีข้อมูล:":"Years:"} ${years.join(", ")||"-"}`}
+        />
+
+        {isYearFallback && (
+          <div style={{marginBottom:14,padding:"11px 14px",borderRadius:8,background:C.amberLo,border:`1px solid ${C.amber}40`,color:C.amber,fontSize:13,fontWeight:700}}>
+            {th
+              ? `ปี ${year} ยังไม่มีข้อมูลงบการเงิน จึงแสดงปีล่าสุดที่มีข้อมูลคือ ${displayYear}`
+              : `FY ${year} has no statement data, showing latest available year ${displayYear}.`}
+          </div>
+        )}
+
+        <div className="responsive-grid-4" style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:14}}>
+          <MetricCard label={th?`รายได้ FY${displayYear}`:`Revenue FY${displayYear}`} value={selectedMetrics.revenue} color={C.green}/>
+          <MetricCard label={th?`กำไรสุทธิ FY${displayYear}`:`Net Profit FY${displayYear}`} value={selectedMetrics.netProfit} color={selectedMetrics.netProfit >= 0 ? C.accent : C.red}/>
+          <MetricCard label={th?`สินทรัพย์รวม FY${displayYear}`:`Total Assets FY${displayYear}`} value={selectedMetrics.asset}/>
+          <MetricCard label={th?`CFO FY${displayYear}`:`CFO FY${displayYear}`} value={selectedMetrics.operatingCashFlow} color={selectedMetrics.operatingCashFlow >= 0 ? C.green : C.red}/>
+        </div>
+
+        <Card style={{padding:0,overflow:"hidden",marginBottom:16}}>
+          <div style={{padding:"14px 18px",borderBottom:`1px solid ${C.border}`,background:C.surface}}>
+            <div style={{fontSize:15,fontWeight:900,color:C.text}}>{th?"งบการเงินรายปี":"Annual Financial Statement View"}</div>
+            <div style={{fontSize:12,color:C.muted,marginTop:4}}>
+              {th
+                ? "ข้อมูลนี้มาจาก normalized_financial_data ที่ import จาก Excel งบการเงินจริง ไม่ใช่ข้อมูลรายเดือน"
+                : "This view is built from normalized_financial_data imported from annual financial statements, not monthly management accounts."}
+            </div>
+          </div>
+          <div style={{overflowX:"auto"}}>
+            <div style={{minWidth:1080}}>
+              <div style={{display:"grid",gridTemplateColumns:"0.7fr repeat(10,1fr)",padding:"14px 18px",borderBottom:`1px solid ${C.border}`,background:C.surface}}>
+                {annualColumns.map((col)=>(
+                  <div key={col.key} style={{fontSize:11,fontWeight:800,color:C.muted,textTransform:"uppercase",letterSpacing:"0.04em",textAlign:col.align || 'right'}}>{th?col.th:col.en}</div>
+                ))}
+              </div>
+              {annualRows.map((row,idx)=>(
+                <div key={row.year} style={{display:"grid",gridTemplateColumns:"0.7fr repeat(10,1fr)",padding:"12px 18px",borderBottom:idx<annualRows.length-1?`1px solid ${C.border}`:"none",alignItems:"center",background:Number(row.year)===Number(displayYear)?C.accentLo:"transparent"}}>
+                  {annualColumns.map((col)=> col.key === 'year' ? (
+                    <div key={col.key} style={{fontSize:13,fontWeight:900,color:C.text,textAlign:'left'}}>FY {row.year}</div>
+                  ) : (
+                    <div key={col.key} style={{fontSize:13,color:col.color||C.text,textAlign:'right',fontWeight:700}}>{fmt(row[col.key], company.currency, true)}</div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          </div>
+        </Card>
+
+        <Card style={{padding:0,overflow:"hidden"}}>
+          <div style={{padding:"14px 18px",borderBottom:`1px solid ${C.border}`,background:C.surface}}>
+            <div style={{fontSize:15,fontWeight:900,color:C.text}}>{th?"มุมมองรายเดือน":"Monthly Operating View"}</div>
+            <div style={{fontSize:12,color:C.muted,marginTop:4}}>
+              {th
+                ? "งบการเงิน SET เป็นข้อมูลรายปี จึงแสดงค่าไว้ที่แถว FY เท่านั้น เดือน ม.ค.–ธ.ค. จะยังไม่มีตัวเลขจนกว่าจะอัปโหลด management account รายเดือน"
+                : "SET financial statements are annual. Values are shown in the FY row only; monthly rows remain empty until monthly management accounts are uploaded."}
+            </div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"0.8fr 1fr 1fr 1fr 1fr 1fr",padding:"14px 18px",borderBottom:`1px solid ${C.border}`,background:C.surface}}>
+            {[th?"เดือน":"Month",th?"รายได้":"Revenue",th?"ค่าใช้จ่าย":"Expense",th?"เงินสดเข้า":"Cash In",th?"เงินสดออก":"Cash Out",th?"เงินกู้":"Loan"].map((h,i)=>(
+              <div key={i} style={{fontSize:11,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:"0.04em"}}>{h}</div>
+            ))}
+          </div>
+          {data.map((d,i)=>{
+            const empty = d.revenue===0&&d.expense===0&&d.cashIn===0&&d.cashOut===0&&d.loanBalance===0;
+            return (
+              <div key={i} style={{display:"grid",gridTemplateColumns:"0.8fr 1fr 1fr 1fr 1fr 1fr",padding:"11px 18px",borderBottom:i<11?`1px solid ${C.border}`:"none",alignItems:"center",opacity:empty?0.35:1,background:i===0?C.overlay2:"transparent"}}>
+                <div style={{fontSize:13,fontWeight:900,color:C.text}}>{d.monthTh || MONTHS[i]?.[th?"th":"en"] || d.monthEn || "-"}</div>
+                <div style={{fontSize:13,color:C.green}}>{fmt(d.revenue,company.currency)}</div>
+                <div style={{fontSize:13,color:C.red}}>{fmt(d.expense,company.currency)}</div>
+                <div style={{fontSize:13,color:C.text}}>{fmt(d.cashIn,company.currency)}</div>
+                <div style={{fontSize:13,color:C.text}}>{fmt(d.cashOut,company.currency)}</div>
+                <div style={{fontSize:13,color:C.amber}}>{fmt(d.loanBalance,company.currency)}</div>
+              </div>
+            );
+          })}
+        </Card>
+      </div>
+    );
+  }
 
   return (
     <div>
@@ -1236,6 +1439,7 @@ export default function App() {
   const handleUpsert = async (batchDetails, rows) => {
     if (isSupabaseConfigured) {
       const result = await saveImportBatch(companyId, batchDetails, rows);
+      if (batchDetails?.fiscalYear) setYear(Number(batchDetails.fiscalYear));
       await refreshRemoteData();
       return result;
     }

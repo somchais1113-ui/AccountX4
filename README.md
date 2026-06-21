@@ -162,3 +162,16 @@ npm run evaluate:parser -- ./path/to/FINANCIAL_STATEMENTS.xlsx
 ```
 
 When a workbook contains comparative years in one file, the import replaces existing rows for every year/period/scope found in the parsed data, not only the primary year.
+
+
+## Parser v1.2 / Normalized Table Adapter
+
+This build adds a normalized annual-statement adapter for the Data Table page. After importing SET-style Excel statements into `normalized_financial_data`, the Data Table now shows an Annual Financial Statement View with FY rows instead of showing all zeros in monthly columns.
+
+Key changes:
+- Derives dashboard/table metrics from `account_group` values stored in `normalized_financial_data`.
+- Shows annual rows for imported years such as 2025 and 2024.
+- Keeps the old Monthly Operating View, but clearly labels that annual financial statements only populate the FY row.
+- If the selected sidebar year has no imported data, the Data Table falls back to the latest available year and displays a warning.
+- After a successful import, the selected year is updated to the imported primary fiscal year.
+
