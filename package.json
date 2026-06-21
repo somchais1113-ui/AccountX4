@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "test": "vitest run",
     "check": "npm run test && npm run build",
-    "doctor:supabase": "node scripts/check-supabase-env.mjs"
+    "doctor:supabase": "node scripts/check-supabase-env.mjs",
+    "evaluate:parser": "node scripts/evaluate-parser-files.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.108.2",

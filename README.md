@@ -41,6 +41,7 @@ VITE_SUPABASE_PUBLISHABLE_KEY=sb_publishable_YOUR_KEY
 | `npm run test` | รัน automated tests |
 | `npm run build` | สร้าง production build |
 | `npm run check` | รัน tests และ build |
+| `npm run evaluate:parser -- <file.xlsx>` | ตรวจผล parser กับไฟล์งบจริง |
 | `npm run preview` | เปิด production preview |
 
 ## ฟีเจอร์
@@ -50,6 +51,7 @@ VITE_SUPABASE_PUBLISHABLE_KEY=sb_publishable_YOUR_KEY
 - Row Level Security และบทบาท Owner/Admin/Editor/Viewer
 - รายชื่อบริษัทและข้อมูลการเงินจาก Supabase
 - CSV validation และตรวจเดือนซ้ำก่อน upsert
+- Industry Parser Pack v1 สำหรับ Retail, Manufacturing, Real Estate, Healthcare และ Banking
 - Audit Log จาก database trigger
 - แปลง USD/EUR เป็น THB ก่อน Consolidation
 - JSON backup/restore และ CSV export
@@ -109,17 +111,45 @@ VITE_SUPABASE_PUBLISHABLE_KEY=sb_publishable_YOUR_KEY
 PPTX generator ถูกโหลดเมื่อกด Export เท่านั้นเพื่อลดขนาดหน้าเว็บเริ่มต้น  
 การ Restore บน Supabase จะนำเข้าเฉพาะบริษัทที่ผู้ใช้มีสิทธิ์และ ID ตรงกับไฟล์สำรอง
 
-## Import Parser v2 notes
+## Industry Parser Pack v1 notes
 
-This build includes `IMPORT_PARSER_V2_SET_TH_LAYOUT`, a more flexible parser for Thai public-company financial statements. It supports:
+This build includes `IMPORT_PARSER_V3_INDUSTRY_PACK_V1`, a more flexible import engine for Thai public-company financial statements.
 
-- Multi-sheet Excel workbooks.
-- Repeated page headers in the same sheet.
-- Thai BE years such as `พ.ศ. 2568` and CE years such as `2025`.
-- Baht / thousand baht / million baht unit detection.
-- Account labels in indented columns A/B/C.
-- Note references such as `10.1` or `15, 16, 17`.
-- Multi-line account labels in statement rows.
-- Dashboard-safe mapping to avoid double counting: total assets, liabilities, equity, revenue, net profit, COGS, SG&A, and net cash-flow rows are mapped to core groups; detailed unmapped rows are retained as `other` for review and audit trail.
+Supported baseline profiles:
 
-When a file contains comparative years in one workbook, the import now replaces existing data for every year/period/scope found in the file, not only the primary year.
+| Profile | Master file used for testing | Key support |
+|---|---|---|
+| Retail / Consumer | MOSHI | SET-style Thai statements, multi-page sheets, retail revenue/COGS/SG&A/cash flow |
+| Manufacturing | CPF | consolidated + separate columns, thousand-baht units, biological assets, related-party loans, internal DS sheets ignored |
+| Real Estate | SPALI | legacy `.XLS`, development costs, land deposits, contract acquisition costs, property sales/revenue patterns |
+| Hospital / Healthcare | BDMS | annual vs 3-month sheet separation, patient revenue, healthcare service cost, member-card liabilities, medical-operation format |
+| Banking / Finance | KBANK | bank-specific balance sheet and income statement items such as deposits, loans, interbank items, ECL, net interest income, fee income, derivatives |
+
+Important parser behavior:
+
+- Accepts `.xlsx`, `.xls`, and `.csv`, but original Excel is preferred.
+- Keeps original Excel layout; users do not need to force finance files into a rigid CSV template.
+- Ignores `DS_INTERNAL_*`, recovered sheets, and BDMS-style quarterly/English 3-month analysis sheets when an annual sheet is present.
+- Detects BE/CE years and filters false future-year detections caused by normal numeric amounts.
+- Detects consolidated vs separate columns per value column instead of applying one scope to the entire sheet.
+- Reads repeated headers, multi-page statements, indented labels, note columns, and multi-line account labels.
+- Maps supporting industry-specific lines instead of forcing everything into `other`.
+- Keeps source traceability through `source_file`, `source_sheet`, `source_cell`, `raw_account_name`, `raw_amount`, and unit fields.
+
+Master fixture evaluation from the five uploaded industry samples:
+
+| File | Rows parsed | Review rows |
+|---|---:|---:|
+| Retail / MOSHI | 220 | 0 |
+| Manufacturing / CPF | 788 | 0 |
+| Real Estate / SPALI | 616 | 0 |
+| Healthcare / BDMS | 656 | 0 |
+| Banking / KBANK | 727 | 0 |
+
+Use this command locally to evaluate more files:
+
+```bash
+npm run evaluate:parser -- ./path/to/FINANCIAL_STATEMENTS.xlsx
+```
+
+When a workbook contains comparative years in one file, the import replaces existing rows for every year/period/scope found in the parsed data, not only the primary year.
