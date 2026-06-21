@@ -126,3 +126,9 @@ npm run check
 - ทดลอง Admin/Owner
 - ตรวจ Audit Log
 - ตั้ง Custom SMTP และ backup policy
+
+## Parser v2 import behavior
+
+For real financial statement Excel files, the app now saves source traceability fields such as source file, sheet, row, column, and cell. It also imports multiple years from one workbook, so a single annual financial-statement file can update both the current year and comparative year data.
+
+After deploying this version, upload the original `.xlsx` file in the Upload page. The preview screen should show detected years, statement count, parsed rows, and review count before saving.

@@ -176,24 +176,30 @@ export async function saveImportBatch(companyId, batchDetails, normalizedDataRow
     raw_account_name: row.raw_account_name,
     raw_amount: row.raw_amount,
     raw_unit: row.raw_unit,
+    source_file: row.source_file || batchDetails.fileName,
     source_sheet: row.source_sheet,
     source_row: row.source_row,
     source_column: row.source_column,
+    source_cell: row.source_cell,
     import_batch_id: batch.id,
     mapping_confidence: row.mapping_confidence,
     needs_review: row.needs_review,
     import_status: 'confirmed'
   }));
   
-  // Clean old data for the same company/year/period/scope to support replace
-  // In a real prod environment we might want soft delete or versioning
-  const { error: deleteError } = await client.from("normalized_financial_data")
-    .delete()
-    .eq("company_id", companyId)
-    .eq("fiscal_year", batchDetails.fiscalYear)
-    .eq("period", batchDetails.period || 'FY')
-    .eq("statement_scope", batchDetails.statementScope || 'consolidated');
-  if (deleteError) throw deleteError;
+  // Clean old data for every year/period/scope found in this upload.
+  // Real financial statements commonly contain comparative columns, e.g. 2025 and 2024 in one file.
+  const replaceKeys = new Set(payload.map((row) => [row.fiscal_year, row.period || 'FY', row.statement_scope || 'consolidated'].join('|')));
+  for (const key of replaceKeys) {
+    const [fiscalYear, period, statementScope] = key.split('|');
+    const { error: deleteError } = await client.from("normalized_financial_data")
+      .delete()
+      .eq("company_id", companyId)
+      .eq("fiscal_year", Number(fiscalYear))
+      .eq("period", period)
+      .eq("statement_scope", statementScope);
+    if (deleteError) throw deleteError;
+  }
 
   const { error: dataError } = await client.from("normalized_financial_data").insert(payload);
   if (dataError) throw dataError;

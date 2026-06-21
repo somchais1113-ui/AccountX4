@@ -7,7 +7,8 @@ export default function ImportWizard({ companyId, onImportSuccess, lang, theme, 
   const [dragging, setDragging] = useState(false);
   const [status, setStatus] = useState(null);
   const [parsedData, setParsedData] = useState([]);
-  const [batchDetails, setBatchDetails] = useState({ fileName: '', fiscalYear: new Date().getFullYear() });
+  const [parseSummary, setParseSummary] = useState(null);
+  const [batchDetails, setBatchDetails] = useState({ fileName: '', fiscalYear: new Date().getFullYear(), periodType: 'annual', period: 'FY', statementScope: 'consolidated' });
   const inputRef = useRef();
 
   const handleFile = async (file) => {
@@ -16,14 +17,15 @@ export default function ImportWizard({ companyId, onImportSuccess, lang, theme, 
     try {
       setBatchDetails(prev => ({ ...prev, fileName: file.name }));
       const rows = await parseFinancialFile(file, companyId);
+      const summary = rows.summary || null;
       if (!rows.length) {
-        setStatus({ type: 'error', msg: th ? 'ไม่พบข้อมูล หรือไม่สามารถวิเคราะห์โครงสร้างได้' : 'No data found or structure unrecognizable.' });
+        setParseSummary(summary);
+        setStatus({ type: 'error', msg: th ? 'ยังไม่พบตัวเลขงบการเงินที่อ่านได้ ระบบรองรับ Excel/CSV ที่มีปี พ.ศ./ค.ศ. และคอลัมน์ตัวเลขงบการเงิน' : 'No readable financial statement rows found. The file needs year columns and financial amounts.' });
         return;
       }
-      // Assuming single year in file for simplicity of batch, but parser gives rows with specific years.
-      // We will set batch fiscalYear to the first row's year
-      const primaryYear = rows[0].fiscal_year;
-      setBatchDetails(prev => ({ ...prev, fiscalYear: primaryYear }));
+      const primaryYear = summary?.primaryYear || rows[0].fiscal_year;
+      setBatchDetails(prev => ({ ...prev, fiscalYear: primaryYear, periodType: 'annual', period: 'FY', statementScope: rows[0].statement_scope || 'consolidated' }));
+      setParseSummary(summary);
       setParsedData(rows);
       setStep(2);
       setStatus(null);
@@ -41,6 +43,7 @@ export default function ImportWizard({ companyId, onImportSuccess, lang, theme, 
       setTimeout(() => {
         setStep(1);
         setParsedData([]);
+        setParseSummary(null);
         setStatus(null);
       }, 2000);
     } catch (err) {
@@ -77,6 +80,9 @@ export default function ImportWizard({ companyId, onImportSuccess, lang, theme, 
           <div style={{ fontSize: 16, fontWeight: 700 }}>{th ? "ลากไฟล์ Excel หรือ CSV มาวางที่นี่" : "Drag Excel or CSV here"}</div>
           <div style={{ fontSize: 14, color: C.muted, marginTop: 8 }}>{th ? "ระบบจะวิเคราะห์โครงสร้างอัตโนมัติ" : "System will analyze structure automatically"}</div>
         </div>
+        <div style={{ marginTop: 12, fontSize: 13, color: C.muted, lineHeight: 1.6 }}>
+          {th ? 'รองรับไฟล์งบการเงินจริงหลาย sheet, header ซ้ำ, ปี พ.ศ./ค.ศ., หน่วย บาท/พันบาท/ล้านบาท และรายการบัญชีที่เยื้องหลายระดับ' : 'Supports multi-sheet statements, repeated headers, BE/CE years, baht/thousand/million units, and indented account lines.'}
+        </div>
         {status && (
           <div style={{ marginTop: 16, padding: 12, borderRadius: 8, background: status.type === 'error' ? C.redLo : C.accentLo, color: status.type === 'error' ? C.red : C.accent }}>
             {status.msg}
@@ -86,7 +92,7 @@ export default function ImportWizard({ companyId, onImportSuccess, lang, theme, 
     );
   }
 
-  const groupOptions = Object.keys(CORE_GROUPS);
+  const groupOptions = Array.from(new Set([...Object.keys(CORE_GROUPS), ...parsedData.map(row => row.account_group).filter(Boolean)])).sort();
 
   return (
     <div style={{ background: C.surface, borderRadius: 12, border: `1px solid ${C.border}`, padding: 24 }}>
@@ -100,12 +106,34 @@ export default function ImportWizard({ companyId, onImportSuccess, lang, theme, 
         </button>
       </div>
 
+      {parseSummary && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 12, marginBottom: 18 }}>
+          <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 10, padding: 12 }}>
+            <div style={{ fontSize: 12, color: C.muted }}>{th ? 'ปีที่พบ' : 'Years Detected'}</div>
+            <div style={{ fontWeight: 800 }}>{parseSummary.years?.map(y => th ? y + 543 : y).join(', ') || '-'}</div>
+          </div>
+          <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 10, padding: 12 }}>
+            <div style={{ fontSize: 12, color: C.muted }}>{th ? 'งบที่พบ' : 'Statements'}</div>
+            <div style={{ fontWeight: 800 }}>{parseSummary.statements?.length || 0}</div>
+          </div>
+          <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 10, padding: 12 }}>
+            <div style={{ fontSize: 12, color: C.muted }}>{th ? 'แถวที่อ่านได้' : 'Parsed Rows'}</div>
+            <div style={{ fontWeight: 800 }}>{parseSummary.rows}</div>
+          </div>
+          <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 10, padding: 12 }}>
+            <div style={{ fontSize: 12, color: C.muted }}>{th ? 'ต้องตรวจสอบ' : 'Needs Review'}</div>
+            <div style={{ fontWeight: 800, color: parseSummary.reviewCount ? C.amber : C.green }}>{parseSummary.reviewCount}</div>
+          </div>
+        </div>
+      )}
+
       <div style={{ overflowX: 'auto' }}>
         <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
           <thead>
             <tr style={{ borderBottom: `2px solid ${C.border}`, textAlign: 'left' }}>
               <th style={{ padding: '12px 8px' }}>Status</th>
               <th style={{ padding: '12px 8px' }}>Statement</th>
+              <th style={{ padding: '12px 8px' }}>Source</th>
               <th style={{ padding: '12px 8px' }}>Account Name (Raw)</th>
               <th style={{ padding: '12px 8px' }}>Year</th>
               <th style={{ padding: '12px 8px', textAlign: 'right' }}>Amount</th>
@@ -119,10 +147,11 @@ export default function ImportWizard({ companyId, onImportSuccess, lang, theme, 
                   {row.needs_review ? '⚠ Review' : '✓ OK'}
                 </td>
                 <td style={{ padding: '12px 8px', color: C.muted }}>{row.statement_type}</td>
+                <td style={{ padding: '12px 8px', color: C.muted }}>{row.source_sheet}{row.source_cell ? `!${row.source_cell}` : ''}</td>
                 <td style={{ padding: '12px 8px', fontWeight: 500 }}>{row.raw_account_name}</td>
                 <td style={{ padding: '12px 8px', color: C.muted }}>{row.fiscal_year}</td>
                 <td style={{ padding: '12px 8px', textAlign: 'right', fontFamily: 'monospace' }}>
-                  {new Intl.NumberFormat().format(row.amount)}
+                  {Number.isFinite(Number(row.amount)) ? new Intl.NumberFormat().format(row.amount) : '-'}
                 </td>
                 <td style={{ padding: '12px 8px' }}>
                   <select 

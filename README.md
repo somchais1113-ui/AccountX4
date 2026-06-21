@@ -108,3 +108,18 @@ VITE_SUPABASE_PUBLISHABLE_KEY=sb_publishable_YOUR_KEY
 
 PPTX generator ถูกโหลดเมื่อกด Export เท่านั้นเพื่อลดขนาดหน้าเว็บเริ่มต้น  
 การ Restore บน Supabase จะนำเข้าเฉพาะบริษัทที่ผู้ใช้มีสิทธิ์และ ID ตรงกับไฟล์สำรอง
+
+## Import Parser v2 notes
+
+This build includes `IMPORT_PARSER_V2_SET_TH_LAYOUT`, a more flexible parser for Thai public-company financial statements. It supports:
+
+- Multi-sheet Excel workbooks.
+- Repeated page headers in the same sheet.
+- Thai BE years such as `พ.ศ. 2568` and CE years such as `2025`.
+- Baht / thousand baht / million baht unit detection.
+- Account labels in indented columns A/B/C.
+- Note references such as `10.1` or `15, 16, 17`.
+- Multi-line account labels in statement rows.
+- Dashboard-safe mapping to avoid double counting: total assets, liabilities, equity, revenue, net profit, COGS, SG&A, and net cash-flow rows are mapped to core groups; detailed unmapped rows are retained as `other` for review and audit trail.
+
+When a file contains comparative years in one workbook, the import now replaces existing data for every year/period/scope found in the file, not only the primary year.
