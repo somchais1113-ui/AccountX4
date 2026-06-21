@@ -1,3 +1,12 @@
+
+## v3.1 Save UX Hotfix
+
+- Moves import save/loading/error messages to the top of Mapping Preview so users can see what happens after clicking Confirm & Save.
+- Disables the Confirm & Save button while saving to prevent duplicate imports.
+- Shows a row count while saving and after success.
+- Adds clearer Supabase error messages for missing normalized tables / migration / RLS permission issues.
+- Inserts normalized rows in chunks for safer larger imports.
+
 # FinAnalytics
 
 แพลตฟอร์มวิเคราะห์การเงินหลายบริษัท รองรับ Supabase Auth/RLS, สิทธิ์รายบริษัท, Audit Log, CSV import, FX consolidation, backup และ PowerPoint export

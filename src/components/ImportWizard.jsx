@@ -6,6 +6,7 @@ export default function ImportWizard({ companyId, onImportSuccess, lang, theme, 
   const [step, setStep] = useState(1);
   const [dragging, setDragging] = useState(false);
   const [status, setStatus] = useState(null);
+  const [saving, setSaving] = useState(false);
   const [parsedData, setParsedData] = useState([]);
   const [parseSummary, setParseSummary] = useState(null);
   const [batchDetails, setBatchDetails] = useState({ fileName: '', fiscalYear: new Date().getFullYear(), periodType: 'annual', period: 'FY', statementScope: 'consolidated' });
@@ -35,20 +36,47 @@ export default function ImportWizard({ companyId, onImportSuccess, lang, theme, 
     }
   };
 
+  const formatErrorMessage = (err) => {
+    const raw = err?.message || String(err || 'Unknown error');
+    if (/import_batches|normalized_financial_data|account_mappings|relation .* does not exist|schema cache/i.test(raw)) {
+      return th
+        ? 'บันทึกไม่สำเร็จ: Supabase ยังไม่มีตาราง normalized/import_batches หรือ schema cache ยังไม่อัปเดต กรุณารัน migration 202606210001_normalized_schema.sql ใน Supabase SQL Editor แล้วลองใหม่'
+        : 'Save failed: Supabase normalized/import_batches tables are missing or schema cache is stale. Run migration 202606210001_normalized_schema.sql in Supabase SQL Editor and try again.';
+    }
+    if (/permission denied|row-level security|violates row-level security|not authorized|Only owners/i.test(raw)) {
+      return th
+        ? 'บันทึกไม่สำเร็จ: สิทธิ์ Supabase ไม่พอ ต้องเป็น owner/admin/editor ของบริษัทนี้ หรือเช็ก RLS policy'
+        : 'Save failed: Supabase permission is not enough. You must be owner/admin/editor for this company, or check RLS policies.';
+    }
+    if (/network|fetch|Failed to fetch/i.test(raw)) {
+      return th
+        ? 'บันทึกไม่สำเร็จ: เชื่อมต่อ Supabase ไม่ได้ชั่วคราว กรุณาเช็กอินเทอร์เน็ตแล้วลองใหม่'
+        : 'Save failed: cannot reach Supabase. Check your connection and try again.';
+    }
+    return raw;
+  };
+
   const handleConfirm = async () => {
-    setStatus({ type: 'loading', msg: th ? 'กำลังบันทึกข้อมูล...' : 'Saving data...' });
+    if (saving) return;
+    setSaving(true);
+    setStatus({ type: 'loading', msg: th ? `กำลังบันทึกข้อมูล ${parsedData.length.toLocaleString()} แถว...` : `Saving ${parsedData.length.toLocaleString()} rows...` });
     try {
-      await onImportSuccess(batchDetails, parsedData);
-      setStatus({ type: 'success', msg: th ? 'บันทึกสำเร็จ!' : 'Saved successfully!' });
+      const result = await onImportSuccess(batchDetails, parsedData);
+      const rowsImported = result?.rowsImported || parsedData.length;
+      setStatus({ type: 'success', msg: th ? `บันทึกสำเร็จ ${rowsImported.toLocaleString()} แถว` : `Saved ${rowsImported.toLocaleString()} rows successfully.` });
+      window.scrollTo({ top: 0, behavior: 'smooth' });
       setTimeout(() => {
         setStep(1);
         setParsedData([]);
         setParseSummary(null);
         setStatus(null);
-      }, 2000);
+        setSaving(false);
+      }, 1800);
     } catch (err) {
       console.error(err);
-      setStatus({ type: 'error', msg: err.message });
+      setStatus({ type: 'error', msg: formatErrorMessage(err) });
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      setSaving(false);
     }
   };
 
@@ -101,10 +129,20 @@ export default function ImportWizard({ companyId, onImportSuccess, lang, theme, 
           <div style={{ fontSize: 18, fontWeight: 700 }}>{th ? "ตรวจสอบการจับคู่บัญชี (Mapping Preview)" : "Mapping Preview"}</div>
           <div style={{ fontSize: 14, color: C.muted }}>{batchDetails.fileName}</div>
         </div>
-        <button onClick={handleConfirm} style={{ background: C.accent, color: '#fff', border: 'none', padding: '10px 20px', borderRadius: 8, fontWeight: 600, cursor: 'pointer' }}>
-          {th ? "ยืนยันและบันทึก" : "Confirm & Save"}
+        <button
+          onClick={handleConfirm}
+          disabled={saving || !parsedData.length}
+          style={{ background: saving ? C.muted : C.accent, color: '#fff', border: 'none', padding: '10px 20px', borderRadius: 8, fontWeight: 600, cursor: saving ? 'wait' : 'pointer', opacity: saving ? 0.75 : 1 }}
+        >
+          {saving ? (th ? "กำลังบันทึก..." : "Saving...") : (th ? "ยืนยันและบันทึก" : "Confirm & Save")}
         </button>
       </div>
+
+      {status && (
+        <div style={{ marginBottom: 16, padding: 12, borderRadius: 8, border: `1px solid ${status.type === 'error' ? C.red : status.type === 'success' ? C.green : C.accent}`, background: status.type === 'error' ? C.redLo : status.type === 'success' ? C.greenLo : C.accentLo, color: status.type === 'error' ? C.red : status.type === 'success' ? C.green : C.accent, fontWeight: 700 }}>
+          {status.msg}
+        </div>
+      )}
 
       {parseSummary && (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 12, marginBottom: 18 }}>
@@ -168,11 +206,7 @@ export default function ImportWizard({ companyId, onImportSuccess, lang, theme, 
           </tbody>
         </table>
       </div>
-      {status && (
-        <div style={{ marginTop: 16, padding: 12, borderRadius: 8, background: status.type === 'error' ? C.redLo : C.greenLo, color: status.type === 'error' ? C.red : C.green }}>
-          {status.msg}
-        </div>
-      )}
+
     </div>
   );
 }

@@ -138,6 +138,29 @@ export async function loadAllNormalizedData() {
   return store;
 }
 
+function normalizeSupabaseError(error) {
+  if (!error) return error;
+  const message = error.message || String(error);
+  if (/schema cache|normalized_financial_data|import_batches|account_mappings|does not exist|Could not find/i.test(message)) {
+    error.message = `${message} — Supabase schema may be missing normalized/import tables. Run supabase/migrations/202606210001_normalized_schema.sql in SQL Editor, then redeploy/refresh.`;
+  }
+  if (/row-level security|permission denied|not authorized/i.test(message)) {
+    error.message = `${message} — check that your user is owner/admin/editor for this company and RLS policies/grants are installed.`;
+  }
+  return error;
+}
+
+async function insertInChunks(client, table, rows, chunkSize = 500) {
+  let inserted = 0;
+  for (let start = 0; start < rows.length; start += chunkSize) {
+    const chunk = rows.slice(start, start + chunkSize);
+    const { error } = await client.from(table).insert(chunk);
+    if (error) throw normalizeSupabaseError(error);
+    inserted += chunk.length;
+  }
+  return inserted;
+}
+
 export async function saveImportBatch(companyId, batchDetails, normalizedDataRows) {
   const client = requireClient();
   const safeRows = Array.isArray(normalizedDataRows) ? normalizedDataRows : [];
@@ -154,7 +177,7 @@ export async function saveImportBatch(companyId, batchDetails, normalizedDataRow
     status: 'confirmed'
   }).select("id").single();
   
-  if (batchError) throw batchError;
+  if (batchError) throw normalizeSupabaseError(batchError);
   
   // 2. Insert normalized data
   const payload = safeRows.map(row => ({
@@ -198,13 +221,12 @@ export async function saveImportBatch(companyId, batchDetails, normalizedDataRow
       .eq("fiscal_year", Number(fiscalYear))
       .eq("period", period)
       .eq("statement_scope", statementScope);
-    if (deleteError) throw deleteError;
+    if (deleteError) throw normalizeSupabaseError(deleteError);
   }
 
-  const { error: dataError } = await client.from("normalized_financial_data").insert(payload);
-  if (dataError) throw dataError;
+  const rowsImported = await insertInChunks(client, "normalized_financial_data", payload);
   
-  return { batchId: batch.id, rowsImported: payload.length };
+  return { batchId: batch.id, rowsImported };
 }
 
 export async function loadExchangeRates(year) {
