@@ -299,3 +299,19 @@ This migration does not delete rows. It only:
 - marks stale monthly rows as `superseded`, keeping the latest confirmed row per company/year/month;
 - marks stale trial-balance rows as `superseded`, keeping the latest confirmed batch per company/year;
 - reconciles `import_batches.status` from `normalized_financial_data`, `monthly_operating_data`, and `trial_balance_data` together.
+
+## v1.7.7 Excel Export Center
+
+No additional Supabase SQL migration is required for this version.
+
+Required previous migrations:
+
+```text
+202606220005_ai_mapping_assistant.sql
+202606220006_dashboard_import_batch_cleanup.sql
+202606220007_import_batch_status_reconcile.sql
+202606220008_dashboard_data_finder_indexes.sql
+202606220009_private_snapshot_reconcile.sql
+```
+
+After deploying v1.7.7, open the new **ส่งออก Excel / Excel Export** menu. The export file includes financial statement sheets, ratios, mapping review rows, raw normalized rows, and import lineage. If mappings still need review, the workbook cover sheet will contain a warning.

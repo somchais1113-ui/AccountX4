@@ -1984,6 +1984,176 @@ function AlertCenterPage({ companyId, companies, lang }) {
   );
 }
 
+
+function ExportCenterPage({ companies, store, importHistory, currentCompanyId, currentYear, lang }) {
+  const C = useC();
+  const th = lang === "th";
+  const [selectedCompanyId, setSelectedCompanyId] = useState(Number(currentCompanyId) || companies?.[0]?.id || 1);
+  const [startYear, setStartYear] = useState(Number(currentYear) || new Date().getFullYear());
+  const [endYear, setEndYear] = useState(Number(currentYear) || new Date().getFullYear());
+  const [sourceMode, setSourceMode] = useState("latest");
+  const [selectedBatchId, setSelectedBatchId] = useState("");
+  const [unit, setUnit] = useState("million");
+  const [labelMode, setLabelMode] = useState("bilingual");
+  const [includeRaw, setIncludeRaw] = useState(true);
+  const [status, setStatus] = useState({ loading:false, error:"", ok:"" });
+
+  const selectedCompany = companies.find((company) => Number(company.id) === Number(selectedCompanyId)) || companies[0] || {};
+  const companyYears = useMemo(() => {
+    const fromStore = Object.keys(store?.[selectedCompanyId] || store?.[String(selectedCompanyId)] || {}).map(Number).filter(Boolean);
+    const fromBatches = (importHistory || []).filter((row) => Number(row.company_id) === Number(selectedCompanyId)).map((row) => Number(row.fiscal_year)).filter(Boolean);
+    return Array.from(new Set([...fromStore, ...fromBatches, Number(currentYear)].filter(Boolean))).sort((a, b) => b - a);
+  }, [store, importHistory, selectedCompanyId, currentYear]);
+
+  useEffect(() => {
+    if (!companyYears.length) return;
+    setStartYear((prev) => companyYears.includes(Number(prev)) ? Number(prev) : companyYears[companyYears.length - 1]);
+    setEndYear((prev) => companyYears.includes(Number(prev)) ? Number(prev) : companyYears[0]);
+  }, [companyYears.join('|')]);
+
+  const yearsToExport = useMemo(() => {
+    const start = Math.min(Number(startYear), Number(endYear));
+    const end = Math.max(Number(startYear), Number(endYear));
+    const years = companyYears.filter((year) => year >= start && year <= end).sort((a, b) => a - b);
+    if (!years.length && start && end) return Array.from({ length: end - start + 1 }, (_, idx) => start + idx);
+    return years;
+  }, [companyYears, startYear, endYear]);
+
+  const companyBatches = useMemo(() => (importHistory || [])
+    .filter((row) => Number(row.company_id) === Number(selectedCompanyId))
+    .sort((a, b) => new Date(b.imported_at || 0) - new Date(a.imported_at || 0)), [importHistory, selectedCompanyId]);
+
+  const latestBatchesForYears = useMemo(() => {
+    const allowedYears = new Set(yearsToExport.map(Number));
+    const selected = [];
+    const seen = new Set();
+    for (const row of companyBatches) {
+      if (row.status !== 'confirmed') continue;
+      if (!allowedYears.has(Number(row.fiscal_year))) continue;
+      const key = `${row.company_id}|${row.fiscal_year}|${row.period || 'FY'}|${row.period_type || 'annual'}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      selected.push(row);
+    }
+    return selected;
+  }, [companyBatches, yearsToExport.join('|')]);
+
+  const selectedBatch = companyBatches.find((row) => row.id === selectedBatchId) || companyBatches[0] || null;
+
+  const selectStyle = {background:C.bg,border:`1px solid ${C.border}`,color:C.text,borderRadius:10,padding:"10px 12px",fontSize:14,fontWeight:800,width:"100%",outline:"none"};
+  const labelStyle = {fontSize:12,color:C.muted,fontWeight:900,textTransform:"uppercase",letterSpacing:"0.04em",marginBottom:7};
+
+  const loadRowsForBatches = async (batches = []) => {
+    if (!isSupabaseConfigured || !includeRaw) return { normalized: [], monthly: [], trialBalance: [] };
+    const ids = batches.map((row) => row.id).filter(Boolean).slice(0, 20);
+    const chunks = await Promise.all(ids.map((batchId) => loadImportBatchRows(batchId, 3000).catch(() => ({ normalized: [], monthly: [], trialBalance: [] }))));
+    return chunks.reduce((acc, chunk) => ({
+      normalized: [...acc.normalized, ...(chunk.normalized || [])],
+      monthly: [...acc.monthly, ...(chunk.monthly || [])],
+      trialBalance: [...acc.trialBalance, ...(chunk.trialBalance || [])],
+    }), { normalized: [], monthly: [], trialBalance: [] });
+  };
+
+  const handleExportExcel = async () => {
+    if (!selectedCompany?.id) return;
+    setStatus({ loading:true, error:"", ok:"" });
+    try {
+      const { exportFinancialExcel } = await import("./lib/exportExcel.js");
+      let exportStore = store;
+      let exportBatches = latestBatchesForYears;
+      let exportYears = yearsToExport;
+      let mode = "latest";
+      if (sourceMode === "batch") {
+        if (!selectedBatch?.id) throw new Error(th ? "กรุณาเลือกไฟล์/BATCH ก่อน Export" : "Please select a batch before export.");
+        const snapshot = isSupabaseConfigured ? await loadFinancialDataSnapshot(selectedBatch.id) : null;
+        exportStore = snapshot?.store || store;
+        exportBatches = [selectedBatch];
+        exportYears = [Number(selectedBatch.fiscal_year)].filter(Boolean);
+        mode = snapshot?.mode || (selectedBatch.status === 'confirmed' ? 'confirmed_snapshot' : 'archived_snapshot');
+      }
+      const raw = await loadRowsForBatches(exportBatches);
+      const mappingRows = isSupabaseConfigured ? await loadMappingReviewRows(selectedCompany.id, 1000).catch(() => []) : [];
+      const filteredMappingRows = mappingRows.filter((row) => !exportYears.length || exportYears.includes(Number(row.fiscal_year)));
+      const fileName = exportFinancialExcel({
+        company: selectedCompany,
+        companyId: selectedCompany.id,
+        store: exportStore,
+        years: exportYears,
+        importBatches: exportBatches,
+        rawRows: [...raw.normalized, ...raw.monthly, ...raw.trialBalance],
+        mappingRows: filteredMappingRows,
+        language: lang,
+        labelMode,
+        unit,
+        mode,
+      });
+      setStatus({ loading:false, error:"", ok: th ? `สร้างไฟล์แล้ว: ${fileName}` : `Exported: ${fileName}` });
+    } catch (error) {
+      setStatus({ loading:false, error:error.message || String(error), ok:"" });
+    }
+  };
+
+  const reviewCount = sourceMode === "batch" ? Number(selectedBatch?.review_count || 0) : latestBatchesForYears.reduce((sum, row) => sum + Number(row.review_count || 0), 0);
+  const rowCount = sourceMode === "batch" ? Number(selectedBatch?.total_rows || 0) : latestBatchesForYears.reduce((sum, row) => sum + Number(row.total_rows || 0), 0);
+
+  return (
+    <div>
+      <PageHeader title={th ? "Export Center / ส่งออก Excel" : "Excel Export Center"} subtitle={th ? "ส่งออกงบการเงิน normalized, dashboard summary, ratio, raw data, mapping review และ data lineage เป็นไฟล์ Excel" : "Export normalized statements, dashboard summary, ratios, raw data, mapping review, and data lineage to Excel."}/>
+      <Card style={{marginBottom:16,border:`1px solid ${reviewCount ? C.amber : C.green}`}}>
+        <div style={{display:"flex",justifyContent:"space-between",gap:16,alignItems:"flex-start",flexWrap:"wrap"}}>
+          <div>
+            <div style={{fontSize:18,fontWeight:950,color:C.white,marginBottom:6}}>📤 {th ? "Analyst Excel Pack" : "Analyst Excel Pack"}</div>
+            <div style={{fontSize:13,color:C.muted,lineHeight:1.65,maxWidth:900}}>
+              {th ? "ตัวเลขในไฟล์ Export จะมาจากข้อมูลจริงใน Supabase และสูตรคำนวณเท่านั้น AI ใช้ช่วยจัดหมวดและแจ้งเตือน ไม่แต่งตัวเลขงบเอง" : "Exported figures come from Supabase data and deterministic formulas only. AI can assist mapping and warnings, but it does not invent statement figures."}
+            </div>
+          </div>
+          <Badge color={reviewCount ? C.amber : C.green}>{reviewCount ? `⚠ ${reviewCount} Review` : "✓ Core clean"}</Badge>
+        </div>
+      </Card>
+
+      <div style={{display:"grid",gridTemplateColumns:"1.25fr 0.75fr",gap:16,alignItems:"start"}}>
+        <Card>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(2,minmax(0,1fr))",gap:14}}>
+            <div><div style={labelStyle}>{th ? "บริษัท" : "Company"}</div><select value={selectedCompanyId} onChange={(e)=>{ setSelectedCompanyId(Number(e.target.value)); setSelectedBatchId(""); }} style={selectStyle}>{companies.map((company)=><option key={company.id} value={company.id}>{company.tickerSymbol ? `${company.tickerSymbol} — ` : ""}{th ? company.nameTh : company.nameEn}</option>)}</select></div>
+            <div><div style={labelStyle}>{th ? "แหล่งข้อมูล" : "Source mode"}</div><select value={sourceMode} onChange={(e)=>setSourceMode(e.target.value)} style={selectStyle}><option value="latest">{th ? "Latest confirmed หลายปี" : "Latest confirmed by year"}</option><option value="batch">{th ? "เลือกไฟล์/BATCH ย้อนหลัง" : "Historical batch / snapshot"}</option></select></div>
+
+            {sourceMode === "latest" ? <>
+              <div><div style={labelStyle}>{th ? "ปีเริ่มต้น" : "Start year"}</div><select value={startYear} onChange={(e)=>setStartYear(Number(e.target.value))} style={selectStyle}>{companyYears.map((year)=><option key={year} value={year}>{year} (พ.ศ.{year+543})</option>)}</select></div>
+              <div><div style={labelStyle}>{th ? "ปีสิ้นสุด" : "End year"}</div><select value={endYear} onChange={(e)=>setEndYear(Number(e.target.value))} style={selectStyle}>{companyYears.map((year)=><option key={year} value={year}>{year} (พ.ศ.{year+543})</option>)}</select></div>
+            </> : <div style={{gridColumn:"1 / -1"}}><div style={labelStyle}>{th ? "ไฟล์ / BATCH" : "File / Batch"}</div><select value={selectedBatchId || selectedBatch?.id || ""} onChange={(e)=>setSelectedBatchId(e.target.value)} style={selectStyle}>{companyBatches.map((row)=><option key={row.id} value={row.id}>{row.fiscal_year} — {row.file_name} — {row.status} — {row.total_rows || 0}/{row.review_count || 0}</option>)}</select></div>}
+
+            <div><div style={labelStyle}>{th ? "ภาษาในไฟล์" : "Labels"}</div><select value={labelMode} onChange={(e)=>setLabelMode(e.target.value)} style={selectStyle}><option value="bilingual">TH / EN Bilingual</option><option value="single">{th ? "ภาษาเดียวตามหน้าเว็บ" : "Single language"}</option></select></div>
+            <div><div style={labelStyle}>{th ? "หน่วยตัวเลข" : "Unit"}</div><select value={unit} onChange={(e)=>setUnit(e.target.value)} style={selectStyle}><option value="baht">{th ? "บาท" : "Baht"}</option><option value="thousand">{th ? "พันบาท" : "Thousand Baht"}</option><option value="million">{th ? "ล้านบาท" : "Million Baht"}</option></select></div>
+          </div>
+
+          <label style={{display:"flex",alignItems:"center",gap:10,marginTop:16,color:C.muted,fontSize:13,fontWeight:800}}>
+            <input type="checkbox" checked={includeRaw} onChange={(e)=>setIncludeRaw(e.target.checked)} />
+            {th ? "รวม Raw normalized data / Mapping review / Data lineage ในไฟล์ Excel" : "Include raw normalized data / mapping review / data lineage in Excel"}
+          </label>
+
+          {reviewCount ? <div style={{marginTop:14,padding:12,borderRadius:10,background:C.amberLo,color:C.amber,fontSize:13,lineHeight:1.6,fontWeight:800}}>⚠ {th ? "ยังมีรายการ Mapping ที่ต้อง Review ไฟล์ Export จะใส่ Warning และ Sheet Mapping Review ให้ตรวจต่อ" : "Some mappings still need review. The export will include a warning and Mapping Review sheet."}</div> : null}
+          {status.error ? <div style={{marginTop:14,color:C.red,fontWeight:800}}>{status.error}</div> : null}
+          {status.ok ? <div style={{marginTop:14,color:C.green,fontWeight:800}}>{status.ok}</div> : null}
+
+          <button type="button" onClick={handleExportExcel} disabled={status.loading || !selectedCompany?.id || (sourceMode === "latest" && !yearsToExport.length)} style={{marginTop:18,border:"none",background:C.green,color:"#fff",borderRadius:12,padding:"12px 18px",fontSize:15,fontWeight:950,cursor:status.loading?"wait":"pointer",opacity:status.loading?0.7:1}}>
+            {status.loading ? (th ? "กำลังสร้าง Excel..." : "Generating Excel...") : (th ? "Export Excel" : "Export Excel")}
+          </button>
+        </Card>
+
+        <Card>
+          <div style={{fontSize:16,fontWeight:950,color:C.white,marginBottom:12}}>{th ? "Export Preview" : "Export Preview"}</div>
+          <div style={{display:"grid",gap:10,fontSize:13}}>
+            <div><div style={labelStyle}>{th ? "บริษัท" : "Company"}</div><div style={{fontWeight:900}}>{selectedCompany.tickerSymbol || selectedCompany.id} — {th ? selectedCompany.nameTh : selectedCompany.nameEn}</div></div>
+            <div><div style={labelStyle}>{th ? "ปี" : "Years"}</div><div style={{fontWeight:900}}>{sourceMode === "latest" ? yearsToExport.join(", ") || "-" : selectedBatch?.fiscal_year || "-"}</div></div>
+            <div><div style={labelStyle}>{th ? "แถว / Review" : "Rows / Review"}</div><div style={{fontWeight:950,color:reviewCount?C.amber:C.green}}>{rowCount.toLocaleString()} / {reviewCount.toLocaleString()}</div></div>
+            <div><div style={labelStyle}>{th ? "ไฟล์ที่จะใช้" : "Source files"}</div><div style={{color:C.muted,lineHeight:1.55}}>{sourceMode === "latest" ? (latestBatchesForYears.map((row)=>`${row.fiscal_year}: ${row.file_name}`).join("\n") || "-") : (selectedBatch?.file_name || "-")}</div></div>
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
 function BackupPage({companies,store,exchangeRates,onImport,lang}) {
   const C = useC();
   const th = lang==="th";
@@ -2027,6 +2197,7 @@ const NAV = [
   {id:"mapping", icon:"🧩", th:"Mapping", en:"Mapping"},
   {id:"alerts", icon:"🔔", th:"แจ้งเตือน", en:"Alerts"},
   {id:"audit", icon:"🧾", th:"Audit Log", en:"Audit Log"},
+  {id:"export", icon:"📤", th:"ส่งออก Excel", en:"Excel Export"},
   {id:"backup", icon:"💾", th:"สำรองข้อมูล", en:"Backup"},
 ];
 
@@ -2321,6 +2492,7 @@ export default function App() {
     if (page==="mapping") return <MappingCenterPage companyId={companyId} lang={lang} onRefresh={refreshRemoteData}/>;
     if (page==="alerts") return <AlertCenterPage companyId={companyId} companies={companies} lang={lang}/>;
     if (page==="audit") return <AuditPage lang={lang}/>;
+    if (page==="export") return <ExportCenterPage companies={companies} store={store} importHistory={importHistory} currentCompanyId={companyId} currentYear={year} lang={lang}/>;
     if (page==="backup") return <BackupPage companies={companies} store={store} exchangeRates={exchangeRates} onImport={handleBackupImport} lang={lang}/>;
   };
 

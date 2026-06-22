@@ -356,3 +356,34 @@ supabase/migrations/202606220009_private_snapshot_reconcile.sql
 
 Known audit note:
 - `npm audit` reports a high-severity advisory from `xlsx`. There is no direct patched version available in the current `xlsx` package line. The app still builds and tests successfully. Long-term mitigation is to replace the workbook parser dependency; short-term mitigation is to keep parsing client-side and avoid uploading untrusted/oversized Excel files.
+
+## v1.7.7 — Excel Export Center
+
+Adds an Excel Export Center for analyst-ready financial exports.
+
+What is included:
+
+- New sidebar menu: **ส่งออก Excel / Excel Export**
+- Export modes:
+  - Latest confirmed by company/year range
+  - Historical batch/snapshot export
+- Export options:
+  - Company selector
+  - Start/end fiscal year
+  - Batch selector
+  - TH/EN bilingual or single-language labels
+  - Baht / Thousand Baht / Million Baht unit scaling
+  - Include raw normalized data, mapping review, and data lineage
+- Generated workbook sheets:
+  - Cover
+  - Dashboard Summary
+  - Income Statement
+  - Balance Sheet
+  - Cash Flow
+  - Ratios
+  - Mapping Review
+  - Raw Data
+  - Data Lineage
+- Safety rule: exported figures come from Supabase data and deterministic formulas only. AI/mapping logic can suggest classifications but must not invent financial statement figures.
+
+No new SQL migration is required for v1.7.7 if v1.7.6 migrations through `202606220009_private_snapshot_reconcile.sql` have already been run.
