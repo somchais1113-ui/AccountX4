@@ -311,3 +311,12 @@ Adds an actor-aware alert layer for auditability and future LINE Messaging API d
 ### Required migration
 Run `supabase/migrations/202606220004_alert_engine.sql` after v1.6 migrations.
 
+
+## v1.7.1 LINE Edge Functions
+
+This version includes server-side LINE Messaging API integration through Supabase Edge Functions.
+
+- `supabase/functions/line-webhook`: LINE webhook receiver and recipient registration helper.
+- `supabase/functions/line-dispatch-alerts`: pending alert dispatcher from `alert_events` to LINE.
+
+Keep LINE tokens and the Supabase service role key in Supabase Edge Function Secrets only. Do not store them in browser code.

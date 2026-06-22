@@ -203,3 +203,71 @@ line_alert_settings
 
 LINE Channel Access Tokens must not be stored in the frontend or public Supabase tables. Store them in server/edge function environment variables when the real LINE push sender is added.
 
+
+## v1.7.1 LINE Edge Functions
+
+This build adds Supabase Edge Functions for real LINE delivery. LINE secrets must stay on the server side only.
+
+### Functions added
+
+- `line-webhook` — receives LINE webhook events, verifies `x-line-signature`, replies with the user/group/room recipient ID, and can register a company with commands such as `register MOSHI`.
+- `line-dispatch-alerts` — reads pending `alert_events` and pushes messages to LINE through the Messaging API.
+
+### Required Supabase secrets
+
+Set these in Supabase Dashboard > Project Settings > Edge Functions > Secrets, or through Supabase CLI:
+
+```bash
+supabase secrets set LINE_CHANNEL_ACCESS_TOKEN="YOUR_LINE_CHANNEL_ACCESS_TOKEN"
+supabase secrets set LINE_CHANNEL_SECRET="YOUR_LINE_CHANNEL_SECRET"
+supabase secrets set SUPABASE_URL="https://YOUR_PROJECT_REF.supabase.co"
+supabase secrets set SUPABASE_SERVICE_ROLE_KEY="YOUR_SERVICE_ROLE_KEY"
+supabase secrets set ALERT_DISPATCH_SECRET="make-a-long-random-secret"
+```
+
+Never put `LINE_CHANNEL_ACCESS_TOKEN`, `LINE_CHANNEL_SECRET`, or `SUPABASE_SERVICE_ROLE_KEY` in `.env`, frontend code, Vercel public env vars, or chat messages.
+
+### Deploy functions
+
+```bash
+supabase functions deploy line-webhook --no-verify-jwt
+supabase functions deploy line-dispatch-alerts --no-verify-jwt
+```
+
+### LINE webhook URL
+
+After deploy, set this URL in LINE Developers / LINE Official Account Messaging API webhook URL:
+
+```text
+https://YOUR_PROJECT_REF.functions.supabase.co/line-webhook
+```
+
+Then enable webhook and verify it.
+
+### Get recipient ID
+
+Add the LINE Official Account as a friend or invite it to a group. Send one of these messages:
+
+```text
+register
+```
+
+The bot replies with the recipient ID. Copy it into FinAnalytics > Alerts > LINE Settings.
+
+Or register a company directly:
+
+```text
+register MOSHI
+```
+
+The bot will find the company by ticker/name and save `recipient_id` in `line_alert_settings`.
+
+### Dispatch pending alerts manually
+
+```bash
+curl -X POST \
+  -H "x-dispatch-secret: YOUR_ALERT_DISPATCH_SECRET" \
+  "https://YOUR_PROJECT_REF.functions.supabase.co/line-dispatch-alerts?limit=20"
+```
+
+For production, schedule this function with Supabase Cron, Vercel Cron, GitHub Actions, or another secure scheduler.
