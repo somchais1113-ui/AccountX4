@@ -272,6 +272,10 @@ function trialBalanceToNormalized(tbRows, fileName) {
         source_column: null,
         source_cell: null,
         mapping_confidence: group === 'other' ? 0.3 : 0.85,
+        mapping_source: group === 'other' ? 'unknown' : 'parser_rule',
+        suggested_account_group: group,
+        suggested_account_subgroup: group,
+        review_reason: group === 'other' ? 'Unknown private-company account mapping.' : null,
         needs_review: group === 'other',
       };
     });

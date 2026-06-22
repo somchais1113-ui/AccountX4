@@ -27,6 +27,90 @@ const requireClient = () => {
   return supabase;
 };
 
+
+const OPTIONAL_MAPPING_COLUMNS = new Set([
+  'mapping_source',
+  'suggested_account_group',
+  'suggested_account_subgroup',
+  'review_reason',
+]);
+
+const OPTIONAL_APPROVAL_COLUMNS = new Set([
+  'is_approved',
+  'mapping_source',
+  'approved_by',
+  'approved_at',
+  'usage_count',
+  'last_used_at',
+]);
+
+function stripColumns(row, columns) {
+  const next = { ...(row || {}) };
+  columns.forEach((col) => delete next[col]);
+  return next;
+}
+
+function isMissingOptionalColumnError(error, columns) {
+  const message = error?.message || String(error || '');
+  return /schema cache|Could not find|column|does not exist/i.test(message) && [...columns].some((col) => message.includes(col));
+}
+
+function normalizeRawAccountKey(value) {
+  return String(value || '')
+    .normalize('NFKC')
+    .replace(/\u00a0/g, ' ')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+async function loadApprovedAccountMappings(client, companyId) {
+  if (!companyId) return [];
+  let { data, error } = await client
+    .from('account_mappings')
+    .select('raw_account_name,statement_type,account_group,account_subgroup,industry_metric,is_approved,mapping_source')
+    .eq('company_id', companyId)
+    .eq('is_approved', true);
+
+  if (error && isMissingOptionalColumnError(error, OPTIONAL_APPROVAL_COLUMNS)) {
+    const fallback = await client
+      .from('account_mappings')
+      .select('raw_account_name,statement_type,account_group,account_subgroup,industry_metric')
+      .eq('company_id', companyId);
+    data = fallback.data;
+    error = fallback.error;
+  }
+  if (error) return [];
+  return data || [];
+}
+
+function applyApprovedAccountMappings(rows = [], approvedMappings = []) {
+  if (!approvedMappings.length) return rows;
+  const lookup = new Map();
+  approvedMappings.forEach((mapping) => {
+    const key = `${mapping.statement_type || ''}|${normalizeRawAccountKey(mapping.raw_account_name)}`;
+    lookup.set(key, mapping);
+  });
+  return rows.map((row) => {
+    const key = `${row.statement_type || ''}|${normalizeRawAccountKey(row.raw_account_name || row.account_name)}`;
+    const mapping = lookup.get(key);
+    if (!mapping) return row;
+    return {
+      ...row,
+      account_group: mapping.account_group,
+      account_subgroup: mapping.account_subgroup || row.account_subgroup || null,
+      industry_metric: mapping.industry_metric || row.industry_metric || null,
+      mapping_confidence: 1,
+      mapping_source: 'approved_mapping',
+      suggested_account_group: mapping.account_group,
+      suggested_account_subgroup: mapping.account_subgroup || null,
+      review_reason: null,
+      needs_review: false,
+    };
+  });
+}
+
 export async function signIn(email, password) {
   const { data, error } = await requireClient().auth.signInWithPassword({ email, password });
   if (error) throw error;
@@ -147,34 +231,141 @@ export async function updateCompany(id, company) {
   if (error) throw error;
 }
 
+async function loadBatchMetaForRows(client, rows = []) {
+  const batchIds = [...new Set(rows.map((row) => row.import_batch_id).filter(Boolean))];
+  if (!batchIds.length) return new Map();
+  const meta = new Map();
+  for (let i = 0; i < batchIds.length; i += 100) {
+    const ids = batchIds.slice(i, i + 100);
+    const { data, error } = await client
+      .from('import_batches')
+      .select('id,status,imported_at')
+      .in('id', ids);
+    if (error) return meta;
+    (data || []).forEach((batch) => meta.set(batch.id, batch));
+  }
+  return meta;
+}
+
+function batchSortTime(record, batchMeta) {
+  const batch = batchMeta.get(record.import_batch_id);
+  const stamp = batch?.imported_at || record.updated_at || record.created_at || '';
+  const value = Date.parse(stamp);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function latestConfirmedRowsByReportingKey(rows = [], batchMeta = new Map()) {
+  const latestByKey = new Map();
+  for (const row of rows) {
+    const batch = batchMeta.get(row.import_batch_id);
+    if (batch && ['superseded', 'rolled_back', 'rejected'].includes(batch.status)) continue;
+    const key = [row.company_id, row.fiscal_year, row.period || 'FY', row.statement_scope || 'consolidated'].join('|');
+    const time = batchSortTime(row, batchMeta);
+    const current = latestByKey.get(key);
+    if (!current || time > current.time) latestByKey.set(key, { batchId: row.import_batch_id || null, time });
+  }
+  return rows.filter((row) => {
+    const batch = batchMeta.get(row.import_batch_id);
+    if (batch && ['superseded', 'rolled_back', 'rejected'].includes(batch.status)) return false;
+    const key = [row.company_id, row.fiscal_year, row.period || 'FY', row.statement_scope || 'consolidated'].join('|');
+    const latest = latestByKey.get(key);
+    if (!latest) return false;
+    if (!latest.batchId) return batchSortTime(row, batchMeta) === latest.time;
+    return row.import_batch_id === latest.batchId;
+  });
+}
+
+
+function latestMonthlyRowsByReportingKey(rows = [], batchMeta = new Map()) {
+  const latestByKey = new Map();
+  for (const row of rows) {
+    const batch = batchMeta.get(row.import_batch_id);
+    if (batch && ['superseded', 'rolled_back', 'rejected'].includes(batch.status)) continue;
+    const key = [row.company_id, row.fiscal_year, row.month].join('|');
+    const time = batchSortTime(row, batchMeta);
+    const current = latestByKey.get(key);
+    if (!current || time > current.time) latestByKey.set(key, { batchId: row.import_batch_id || null, time });
+  }
+  return rows.filter((row) => {
+    const batch = batchMeta.get(row.import_batch_id);
+    if (batch && ['superseded', 'rolled_back', 'rejected'].includes(batch.status)) return false;
+    const key = [row.company_id, row.fiscal_year, row.month].join('|');
+    const latest = latestByKey.get(key);
+    if (!latest) return false;
+    if (!latest.batchId) return batchSortTime(row, batchMeta) === latest.time;
+    return row.import_batch_id === latest.batchId;
+  });
+}
+
+function buildNormalizedStore(rows = [], batchMeta = new Map()) {
+  const store = {};
+  (rows || []).forEach((record) => {
+    store[record.company_id] ||= {};
+    store[record.company_id][record.fiscal_year] ||= {};
+
+    const periodKey = record.period || 'FY';
+    const batch = batchMeta.get(record.import_batch_id) || null;
+    store[record.company_id][record.fiscal_year][periodKey] ||= {
+      _updatedAt: record.updated_at || batch?.imported_at || null,
+      _sourceFile: record.source_file || batch?.file_name || null,
+      _sourceType: batch?.source_type || record.source_type || 'normalized_financial_data',
+      _batchStatus: batch?.status || record.import_status || 'confirmed',
+      status: record.import_status || batch?.status || 'confirmed',
+      import_batch_id: record.import_batch_id,
+      review_count: 0,
+      row_count: 0,
+      groups: {}
+    };
+
+    const pd = store[record.company_id][record.fiscal_year][periodKey];
+    const groupKey = record.account_group || 'other';
+    pd.groups[groupKey] = (pd.groups[groupKey] || 0) + Number(record.amount || 0);
+    pd.row_count = (pd.row_count || 0) + 1;
+    if (record.needs_review) pd.review_count = (pd.review_count || 0) + 1;
+  });
+  return store;
+}
+
+function buildMonthlyStore(rows = [], batchMeta = new Map()) {
+  const store = {};
+  (rows || []).forEach((record) => {
+    store[record.company_id] ||= {};
+    store[record.company_id][record.fiscal_year] ||= {};
+    const idx = Number(record.month) - 1;
+    const batch = batchMeta.get(record.import_batch_id) || null;
+    store[record.company_id][record.fiscal_year][idx] = {
+      monthIdx: idx,
+      revenue: Number(record.revenue) || 0,
+      expense: Number(record.expense) || 0,
+      cashIn: Number(record.cash_in) || 0,
+      cashOut: Number(record.cash_out) || 0,
+      loanBalance: Number(record.loan_balance) || 0,
+      import_batch_id: record.import_batch_id,
+      _sourceType: batch?.source_type || 'private_monthly_report',
+      _sourceFile: batch?.file_name || null,
+      _batchStatus: batch?.status || record.import_status || 'confirmed',
+      _updatedAt: record.updated_at || batch?.imported_at || null,
+    };
+  });
+  return store;
+}
+
 export async function loadAllNormalizedData() {
-  const { data, error } = await requireClient()
+  const client = requireClient();
+  const { data, error } = await client
     .from("normalized_financial_data")
     .select("*")
     .eq("import_status", "confirmed")
     .order("fiscal_year")
     .order("period");
   if (error) throw error;
-  
-  // Transform flat rows into a hierarchical store for the dashboard
-  const store = {};
-  (data || []).forEach((record) => {
-    store[record.company_id] ||= {};
-    store[record.company_id][record.fiscal_year] ||= {};
-    
-    // Default period for annual is 'FY'
-    const periodKey = record.period || 'FY';
-    store[record.company_id][record.fiscal_year][periodKey] ||= {
-      _updatedAt: record.updated_at,
-      status: record.import_status,
-      groups: {}
-    };
-    
-    // Accumulate by group (e.g. revenue, expense)
-    const pd = store[record.company_id][record.fiscal_year][periodKey];
-    pd.groups[record.account_group] = (pd.groups[record.account_group] || 0) + Number(record.amount);
-  });
-  return store;
+
+  // Guardrail: older app versions left multiple confirmed batches for the same
+  // company/year/period/scope. The dashboard should use the latest active batch only,
+  // otherwise graphs can look unchanged or double-count historical imports.
+  const batchMeta = await loadBatchMetaForRows(client, data || []);
+  const activeRows = latestConfirmedRowsByReportingKey(data || [], batchMeta);
+  return buildNormalizedStore(activeRows, batchMeta);
 }
 
 
@@ -190,23 +381,11 @@ export async function loadAllMonthlyOperatingData() {
     if (/monthly_operating_data|schema cache|Could not find|does not exist/i.test(error.message || '')) return {};
     throw error;
   }
-  const store = {};
-  (data || []).forEach((record) => {
-    store[record.company_id] ||= {};
-    store[record.company_id][record.fiscal_year] ||= {};
-    const idx = Number(record.month) - 1;
-    store[record.company_id][record.fiscal_year][idx] = {
-      monthIdx: idx,
-      revenue: Number(record.revenue) || 0,
-      expense: Number(record.expense) || 0,
-      cashIn: Number(record.cash_in) || 0,
-      cashOut: Number(record.cash_out) || 0,
-      loanBalance: Number(record.loan_balance) || 0,
-      _sourceType: 'private_monthly_report',
-      _updatedAt: record.updated_at,
-    };
-  });
-  return store;
+  // Guardrail: keep monthly dashboard values locked to the latest active batch per company/year/month.
+  // Older private-company uploads may still have stale confirmed rows until cleanup migrations are run.
+  const batchMeta = await loadBatchMetaForRows(client, data || []);
+  const activeRows = latestMonthlyRowsByReportingKey(data || [], batchMeta);
+  return buildMonthlyStore(activeRows, batchMeta);
 }
 
 function mergeStores(...stores) {
@@ -230,6 +409,43 @@ export async function loadAllFinancialData() {
   return mergeStores(normalizedStore, monthlyStore);
 }
 
+export async function loadFinancialDataSnapshot(batchId) {
+  const client = requireClient();
+  if (!batchId || batchId === 'latest') {
+    return { mode: 'latest', batch: null, store: await loadAllFinancialData(), rowCounts: { normalized: 0, monthly: 0, trialBalance: 0 } };
+  }
+
+  const { data: batch, error: batchError } = await client
+    .from('import_batches')
+    .select('id,company_id,file_name,fiscal_year,period_type,period,statement_scope,source_type,parser_profile,legal_entity_type,status,total_rows,review_count,file_hash,file_size,storage_path,imported_at,companies(name_th,name_en,ticker_symbol,industry,currency)')
+    .eq('id', batchId)
+    .single();
+  if (batchError) throw normalizeSupabaseError(batchError);
+
+  const [normalized, monthly, trial] = await Promise.all([
+    client.from('normalized_financial_data').select('*').eq('import_batch_id', batchId).limit(10000),
+    client.from('monthly_operating_data').select('*').eq('import_batch_id', batchId).limit(10000),
+    client.from('trial_balance_data').select('*').eq('import_batch_id', batchId).limit(10000),
+  ]);
+  const safe = (res, tableName) => {
+    if (!res.error) return res.data || [];
+    if (/schema cache|Could not find|does not exist/i.test(res.error.message || '')) return [];
+    throw normalizeSupabaseError(res.error);
+  };
+
+  const normalizedRows = safe(normalized, 'normalized_financial_data');
+  const monthlyRows = safe(monthly, 'monthly_operating_data');
+  const trialRows = safe(trial, 'trial_balance_data');
+  const batchMeta = new Map([[batch.id, batch]]);
+
+  return {
+    mode: batch.status === 'confirmed' ? 'confirmed_snapshot' : 'archived_snapshot',
+    batch,
+    store: mergeStores(buildNormalizedStore(normalizedRows, batchMeta), buildMonthlyStore(monthlyRows, batchMeta)),
+    rowCounts: { normalized: normalizedRows.length, monthly: monthlyRows.length, trialBalance: trialRows.length },
+  };
+}
+
 function normalizeSupabaseError(error) {
   if (!error) return error;
   const message = error.message || String(error);
@@ -246,7 +462,12 @@ async function insertInChunks(client, table, rows, chunkSize = 500) {
   let inserted = 0;
   for (let start = 0; start < rows.length; start += chunkSize) {
     const chunk = rows.slice(start, start + chunkSize);
-    const { error } = await client.from(table).insert(chunk);
+    let { error } = await client.from(table).insert(chunk);
+    if (error && table === 'normalized_financial_data' && isMissingOptionalColumnError(error, OPTIONAL_MAPPING_COLUMNS)) {
+      const fallbackChunk = chunk.map((row) => stripColumns(row, OPTIONAL_MAPPING_COLUMNS));
+      const fallback = await client.from(table).insert(fallbackChunk);
+      error = fallback.error;
+    }
     if (error) throw normalizeSupabaseError(error);
     inserted += chunk.length;
   }
@@ -419,9 +640,11 @@ async function uploadRawFileForBatch(client, companyId, batchId, batchDetails = 
 }
 
 async function upsertAccountMappings(client, companyId, rows = []) {
+  // Safety rule: never train from parser/AI suggestions during import.
+  // Account mappings are persisted only after human approval, or when re-saving an already approved mapping.
   const seen = new Set();
   const mappings = rows
-    .filter(row => row.raw_account_name && row.statement_type && row.account_group)
+    .filter(row => row.raw_account_name && row.statement_type && row.account_group && row.needs_review === false && row.mapping_source === 'approved_mapping')
     .map(row => {
       const key = `${row.statement_type}|${row.raw_account_name}`;
       if (seen.has(key)) return null;
@@ -433,22 +656,77 @@ async function upsertAccountMappings(client, companyId, rows = []) {
         account_group: row.account_group,
         account_subgroup: row.account_subgroup || null,
         industry_metric: row.industry_metric || null,
+        is_approved: true,
+        mapping_source: 'approved_mapping',
+        last_used_at: new Date().toISOString(),
       };
     })
     .filter(Boolean)
     .slice(0, 2000);
   if (!mappings.length) return;
   try {
-    await client.from('account_mappings').upsert(mappings, { onConflict: 'company_id,raw_account_name,statement_type' });
+    let { error } = await client.from('account_mappings').upsert(mappings, { onConflict: 'company_id,raw_account_name,statement_type' });
+    if (error && isMissingOptionalColumnError(error, OPTIONAL_APPROVAL_COLUMNS)) {
+      const fallback = await client.from('account_mappings').upsert(
+        mappings.map((row) => stripColumns(row, OPTIONAL_APPROVAL_COLUMNS)),
+        { onConflict: 'company_id,raw_account_name,statement_type' }
+      );
+      error = fallback.error;
+    }
   } catch (_) {
     // Mapping persistence is helpful but should not block imports.
   }
 }
 
+
+async function markPreviousImportBatchesSuperseded(client, companyId, fiscalYear, period, statementScope) {
+  try {
+    const { data, error } = await client
+      .from('normalized_financial_data')
+      .select('import_batch_id')
+      .eq('company_id', companyId)
+      .eq('fiscal_year', Number(fiscalYear))
+      .eq('period', period || 'FY')
+      .eq('statement_scope', statementScope || 'consolidated')
+      .eq('import_status', 'confirmed');
+    if (error) return;
+    const batchIds = [...new Set((data || []).map((row) => row.import_batch_id).filter(Boolean))];
+    if (!batchIds.length) return;
+    await client
+      .from('import_batches')
+      .update({ status: 'superseded' })
+      .in('id', batchIds)
+      .eq('status', 'confirmed');
+  } catch (_) {
+    // Best-effort only. Normalized rows are still marked as superseded below.
+  }
+}
+
+async function markPreviousDataTableImportBatchesSuperseded(client, tableName, applyFilters) {
+  try {
+    const baseQuery = client
+      .from(tableName)
+      .select('import_batch_id')
+      .eq('import_status', 'confirmed');
+    const { data, error } = await applyFilters(baseQuery);
+    if (error) return;
+    const batchIds = [...new Set((data || []).map((row) => row.import_batch_id).filter(Boolean))];
+    if (!batchIds.length) return;
+    await client
+      .from('import_batches')
+      .update({ status: 'superseded' })
+      .in('id', batchIds)
+      .eq('status', 'confirmed');
+  } catch (_) {
+    // Best-effort only. Data rows are still marked as superseded or deleted below.
+  }
+}
+
 export async function saveImportBatch(companyId, batchDetails, normalizedDataRows) {
   const client = requireClient();
-  const safeRows = Array.isArray(normalizedDataRows) ? normalizedDataRows : [];
-  if (!safeRows.length) return { batchId: null, rowsImported: 0 };
+  const incomingRows = Array.isArray(normalizedDataRows) ? normalizedDataRows : [];
+  if (!incomingRows.length) return { batchId: null, rowsImported: 0 };
+  const safeRows = applyApprovedAccountMappings(incomingRows, await loadApprovedAccountMappings(client, companyId));
   
   // 1. Create batch
   const batchPayload = {
@@ -503,6 +781,10 @@ export async function saveImportBatch(companyId, batchDetails, normalizedDataRow
     source_cell: row.source_cell,
     import_batch_id: batch.id,
     mapping_confidence: row.mapping_confidence,
+    mapping_source: row.mapping_source || (row.needs_review ? 'unknown' : 'parser_rule'),
+    suggested_account_group: row.suggested_account_group || row.account_group,
+    suggested_account_subgroup: row.suggested_account_subgroup || row.account_subgroup || null,
+    review_reason: row.review_reason || null,
     needs_review: row.needs_review,
     import_status: 'confirmed'
   }));
@@ -512,6 +794,7 @@ export async function saveImportBatch(companyId, batchDetails, normalizedDataRow
   const replaceKeys = new Set(payload.map((row) => [row.fiscal_year, row.period || 'FY', row.statement_scope || 'consolidated'].join('|')));
   for (const key of replaceKeys) {
     const [fiscalYear, period, statementScope] = key.split('|');
+    await markPreviousImportBatchesSuperseded(client, companyId, fiscalYear, period, statementScope);
     await updateIfSupported(
       () => client.from("normalized_financial_data")
         .update({ import_status: 'superseded' })
@@ -571,7 +854,8 @@ export async function savePrivateImportBatch(companyId, batchDetails, privatePay
   const client = requireClient();
   const monthlyRows = Array.isArray(privatePayload.monthlyRows) ? privatePayload.monthlyRows : [];
   const trialBalanceRows = Array.isArray(privatePayload.trialBalanceRows) ? privatePayload.trialBalanceRows : [];
-  const normalizedRows = Array.isArray(privatePayload.normalizedRows) ? privatePayload.normalizedRows : [];
+  const incomingNormalizedRows = Array.isArray(privatePayload.normalizedRows) ? privatePayload.normalizedRows : [];
+  const normalizedRows = applyApprovedAccountMappings(incomingNormalizedRows, await loadApprovedAccountMappings(client, companyId));
   const totalInputRows = monthlyRows.length + trialBalanceRows.length + normalizedRows.length;
   if (!totalInputRows) return { batchId: null, rowsImported: 0 };
 
@@ -606,6 +890,11 @@ export async function savePrivateImportBatch(companyId, batchDetails, privatePay
     const deleteKeys = new Set(monthlyRows.map(row => [row.fiscal_year, row.month].join('|')));
     for (const key of deleteKeys) {
       const [fiscalYear, month] = key.split('|');
+      await markPreviousDataTableImportBatchesSuperseded(client, 'monthly_operating_data', (query) => query
+        .eq("company_id", companyId)
+        .eq("fiscal_year", Number(fiscalYear))
+        .eq("month", Number(month))
+      );
       await updateIfSupported(
         () => client.from("monthly_operating_data")
           .update({ import_status: 'superseded' })
@@ -641,6 +930,10 @@ export async function savePrivateImportBatch(companyId, batchDetails, privatePay
   if (trialBalanceRows.length) {
     const deleteYears = new Set(trialBalanceRows.map(row => row.fiscal_year));
     for (const fiscalYear of deleteYears) {
+      await markPreviousDataTableImportBatchesSuperseded(client, 'trial_balance_data', (query) => query
+        .eq("company_id", companyId)
+        .eq("fiscal_year", Number(fiscalYear))
+      );
       await updateIfSupported(
         () => client.from("trial_balance_data")
           .update({ import_status: 'superseded' })
@@ -700,12 +993,17 @@ export async function savePrivateImportBatch(companyId, batchDetails, privatePay
       source_cell: row.source_cell,
       import_batch_id: batch.id,
       mapping_confidence: row.mapping_confidence,
+      mapping_source: row.mapping_source || (row.needs_review ? 'unknown' : 'parser_rule'),
+      suggested_account_group: row.suggested_account_group || row.account_group,
+      suggested_account_subgroup: row.suggested_account_subgroup || row.account_subgroup || null,
+      review_reason: row.review_reason || null,
       needs_review: row.needs_review,
       import_status: 'confirmed'
     }));
     const replaceKeys = new Set(payload.map((row) => [row.fiscal_year, row.period || 'FY', row.statement_scope || 'private_company'].join('|')));
     for (const key of replaceKeys) {
       const [fiscalYear, period, statementScope] = key.split('|');
+      await markPreviousImportBatchesSuperseded(client, companyId, fiscalYear, period, statementScope);
       await updateIfSupported(
         () => client.from("normalized_financial_data")
           .update({ import_status: 'superseded' })
@@ -846,42 +1144,93 @@ export async function rollbackImportBatch(batchId) {
 
 export async function loadMappingReviewRows(companyId = null, limit = 500) {
   const client = requireClient();
-  let query = client
+  const baseQuery = () => client
     .from('normalized_financial_data')
-    .select('id,company_id,fiscal_year,statement_type,raw_account_name,account_name,account_group,account_subgroup,mapping_confidence,needs_review,source_file,source_sheet,source_row,companies(name_th,name_en,ticker_symbol)')
-    .or('needs_review.eq.true,mapping_confidence.lt.0.86,account_group.eq.other')
+    .select('id,company_id,fiscal_year,statement_type,raw_account_name,account_name,account_group,account_subgroup,mapping_confidence,mapping_source,suggested_account_group,suggested_account_subgroup,review_reason,needs_review,source_file,source_sheet,source_row,companies(name_th,name_en,ticker_symbol)')
+    .or('needs_review.eq.true,mapping_confidence.lt.0.86,account_group.eq.other,mapping_source.in.(accounting_dictionary,ai_similarity,unknown)')
     .eq('import_status', 'confirmed')
     .order('fiscal_year', { ascending: false })
     .limit(limit);
+  let query = baseQuery();
   if (companyId) query = query.eq('company_id', companyId);
-  const { data, error } = await query;
+  let { data, error } = await query;
+
+  if (error && isMissingOptionalColumnError(error, OPTIONAL_MAPPING_COLUMNS)) {
+    let fallbackQuery = client
+      .from('normalized_financial_data')
+      .select('id,company_id,fiscal_year,statement_type,raw_account_name,account_name,account_group,account_subgroup,mapping_confidence,needs_review,source_file,source_sheet,source_row,companies(name_th,name_en,ticker_symbol)')
+      .or('needs_review.eq.true,mapping_confidence.lt.0.86,account_group.eq.other')
+      .eq('import_status', 'confirmed')
+      .order('fiscal_year', { ascending: false })
+      .limit(limit);
+    if (companyId) fallbackQuery = fallbackQuery.eq('company_id', companyId);
+    const fallback = await fallbackQuery;
+    data = (fallback.data || []).map((row) => ({
+      ...row,
+      mapping_source: row.account_group === 'other' ? 'unknown' : 'parser_rule',
+      suggested_account_group: row.account_group,
+      suggested_account_subgroup: row.account_subgroup,
+      review_reason: row.account_group === 'other' ? 'Unknown or low-confidence accounting mapping.' : null,
+    }));
+    error = fallback.error;
+  }
   if (error) throw normalizeSupabaseError(error);
   return data || [];
 }
 
 export async function updateMappingForRawAccount({ companyId, rawAccountName, statementType, accountGroup, accountSubgroup = null }) {
   const client = requireClient();
-  const { error: mapError } = await client.from('account_mappings').upsert({
+  const actor = await getCurrentActor(client);
+  const mapPayload = {
     company_id: companyId,
     raw_account_name: rawAccountName,
     statement_type: statementType,
     account_group: accountGroup,
     account_subgroup: accountSubgroup,
-  }, { onConflict: 'company_id,raw_account_name,statement_type' });
+    is_approved: true,
+    mapping_source: 'approved_mapping',
+    approved_by: actor.actor_user_id || null,
+    approved_at: new Date().toISOString(),
+    last_used_at: new Date().toISOString(),
+  };
+  let { error: mapError } = await client.from('account_mappings').upsert(mapPayload, { onConflict: 'company_id,raw_account_name,statement_type' });
+  if (mapError && isMissingOptionalColumnError(mapError, OPTIONAL_APPROVAL_COLUMNS)) {
+    const fallback = await client.from('account_mappings').upsert(stripColumns(mapPayload, OPTIONAL_APPROVAL_COLUMNS), { onConflict: 'company_id,raw_account_name,statement_type' });
+    mapError = fallback.error;
+  }
   if (mapError) throw normalizeSupabaseError(mapError);
-  const { error: rowError } = await client.from('normalized_financial_data')
-    .update({ account_group: accountGroup, account_subgroup: accountSubgroup, needs_review: false, mapping_confidence: 1 })
+
+  const rowUpdate = {
+    account_group: accountGroup,
+    account_subgroup: accountSubgroup,
+    needs_review: false,
+    mapping_confidence: 1,
+    mapping_source: 'approved_mapping',
+    suggested_account_group: accountGroup,
+    suggested_account_subgroup: accountSubgroup,
+    review_reason: null,
+  };
+  let { error: rowError } = await client.from('normalized_financial_data')
+    .update(rowUpdate)
     .eq('company_id', companyId)
     .eq('raw_account_name', rawAccountName)
     .eq('statement_type', statementType);
+  if (rowError && isMissingOptionalColumnError(rowError, OPTIONAL_MAPPING_COLUMNS)) {
+    const fallback = await client.from('normalized_financial_data')
+      .update(stripColumns(rowUpdate, OPTIONAL_MAPPING_COLUMNS))
+      .eq('company_id', companyId)
+      .eq('raw_account_name', rawAccountName)
+      .eq('statement_type', statementType);
+    rowError = fallback.error;
+  }
   if (rowError) throw normalizeSupabaseError(rowError);
   await createAlertEventSafe(client, {
     eventType: 'mapping_changed',
     severity: 'warning',
     companyId,
-    title: 'Account mapping changed',
-    message: `${rawAccountName} mapped to ${accountGroup}.`,
-    metadata: { raw_account_name: rawAccountName, statement_type: statementType, account_group: accountGroup, account_subgroup: accountSubgroup },
+    title: 'Account mapping approved',
+    message: `${rawAccountName} approved as ${accountGroup}.`,
+    metadata: { raw_account_name: rawAccountName, statement_type: statementType, account_group: accountGroup, account_subgroup: accountSubgroup, mapping_source: 'approved_mapping' },
   });
 }
 

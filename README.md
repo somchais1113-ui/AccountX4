@@ -320,3 +320,39 @@ This version includes server-side LINE Messaging API integration through Supabas
 - `supabase/functions/line-dispatch-alerts`: pending alert dispatcher from `alert_events` to LINE.
 
 Keep LINE tokens and the Supabase service role key in Supabase Edge Function Secrets only. Do not store them in browser code.
+
+## v1.7.5 — Dashboard Data Finder & Historical Snapshot Viewer
+
+This release adds a Dashboard Data Finder so users can search companies, switch fiscal years, and open a specific uploaded batch/file directly from the Dashboard.
+
+Key behavior:
+- Latest confirmed mode remains the default Dashboard data source.
+- Historical Snapshot mode can open confirmed, superseded, or rolled-back batches for audit/backtracking.
+- The Dashboard now shows current file name, batch ID, row count, review count, and status.
+- Upload success resets the Dashboard back to Latest confirmed and refreshes Supabase data.
+- Import History includes an “Open Dash” action to load a batch snapshot immediately.
+
+Run this migration in Supabase SQL Editor after the previous migrations:
+
+```sql
+supabase/migrations/202606220008_dashboard_data_finder_indexes.sql
+```
+
+## v1.7.6 — Error Guardrails & Private Snapshot Reconcile
+
+This release is a double-check patch after v1.7.5.
+
+Key fixes:
+- Locks private monthly Dashboard values to the latest active batch per company/year/month.
+- Marks previous private monthly and trial-balance import batches as `superseded` when a replacement import is saved.
+- Adds a reconcile migration for historical private-company snapshots.
+- Removes duplicate object keys in frontend payload builders.
+
+Run this migration in Supabase SQL Editor after v1.7.5:
+
+```sql
+supabase/migrations/202606220009_private_snapshot_reconcile.sql
+```
+
+Known audit note:
+- `npm audit` reports a high-severity advisory from `xlsx`. There is no direct patched version available in the current `xlsx` package line. The app still builds and tests successfully. Long-term mitigation is to replace the workbook parser dependency; short-term mitigation is to keep parsing client-side and avoid uploading untrusted/oversized Excel files.

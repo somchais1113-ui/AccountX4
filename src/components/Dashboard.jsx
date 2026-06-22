@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
   Line, ComposedChart, Cell, ReferenceLine
@@ -192,7 +192,158 @@ const statementRows = (th) => ({
   ],
 });
 
-export default function MomentumDashboard({ store, companyId, lang, C, COMPANIES }) {
+
+function formatBatchDate(value, th) {
+  if (!value) return '-';
+  try { return new Date(value).toLocaleString(th ? 'th-TH' : 'en-GB'); }
+  catch (_) { return '-'; }
+}
+
+function batchCompanyName(row, th) {
+  return row?.companies?.ticker_symbol || (th ? row?.companies?.name_th : row?.companies?.name_en) || row?.company_id || '-';
+}
+
+function DashboardDataFinder({
+  C,
+  th,
+  companies = [],
+  companyId,
+  selectedYear,
+  importHistory = [],
+  selectedBatchId = 'latest',
+  currentPeriodMeta = {},
+  sourceMeta = null,
+  finderLoading = false,
+  onCompanyChange,
+  onYearChange,
+  onSelectSnapshot,
+}) {
+  const [query, setQuery] = useState('');
+  const safeQuery = query.trim().toLowerCase();
+  const filteredCompanies = companies.filter((company) => {
+    if (!safeQuery) return true;
+    return [company.nameTh, company.nameEn, company.tickerSymbol, company.id]
+      .map((value) => String(value || '').toLowerCase())
+      .some((value) => value.includes(safeQuery));
+  });
+
+  const companyBatches = importHistory
+    .filter((row) => Number(row.company_id) === Number(companyId))
+    .sort((a, b) => new Date(b.imported_at || 0) - new Date(a.imported_at || 0));
+
+  const historyYears = [...new Set(companyBatches.map((row) => Number(row.fiscal_year)).filter(Boolean))].sort((a, b) => b - a);
+  const selectedYearNumber = Number(selectedYear) || historyYears[0] || new Date().getFullYear();
+  const yearBatches = companyBatches.filter((row) => Number(row.fiscal_year) === selectedYearNumber);
+  const latestSource = selectedBatchId !== 'latest'
+    ? sourceMeta
+    : companyBatches.find((row) => row.id && currentPeriodMeta?.import_batch_id && row.id === currentPeriodMeta.import_batch_id);
+  const activeSource = latestSource || sourceMeta || null;
+  const isArchived = activeSource && activeSource.status && activeSource.status !== 'confirmed';
+  const sourceRows = activeSource?.rowCounts?.normalized ?? activeSource?.total_rows ?? currentPeriodMeta?.row_count ?? 0;
+  const reviewRows = activeSource?.review_count ?? currentPeriodMeta?.review_count ?? 0;
+
+  const selectStyle = {
+    width: '100%',
+    minHeight: 38,
+    borderRadius: 9,
+    border: `1px solid ${C.border}`,
+    background: C.surface,
+    color: C.text,
+    padding: '8px 10px',
+    outline: 'none',
+    fontSize: 13,
+    fontWeight: 700,
+  };
+  const labelStyle = { fontSize: 11, color: C.muted, fontWeight: 900, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 };
+
+  return (
+    <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: 16, marginBottom: 18 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'flex-start', marginBottom: 14, flexWrap: 'wrap' }}>
+        <div>
+          <div style={{ fontSize: 16, fontWeight: 950, color: C.text }}>{th ? 'Data Finder / ค้นหาข้อมูลงบ' : 'Dashboard Data Finder'}</div>
+          <div style={{ fontSize: 12, color: C.muted, marginTop: 3, lineHeight: 1.5 }}>
+            {th ? 'เลือกบริษัท ปี และไฟล์/batch เพื่อดูข้อมูลล่าสุดหรือเปิด snapshot ย้อนหลังบนหน้า Dashboard' : 'Select company, FY, and batch/file to view latest data or an archived snapshot.'}
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <span style={{ padding: '6px 10px', borderRadius: 999, background: selectedBatchId === 'latest' ? C.greenLo : C.amberLo, color: selectedBatchId === 'latest' ? C.green : C.amber, fontSize: 12, fontWeight: 900 }}>
+            {selectedBatchId === 'latest' ? (th ? 'Latest confirmed' : 'Latest confirmed') : (th ? 'Historical snapshot' : 'Historical snapshot')}
+          </span>
+          {finderLoading && <span style={{ padding: '6px 10px', borderRadius: 999, background: C.accentLo, color: C.accent, fontSize: 12, fontWeight: 900 }}>{th ? 'กำลังโหลด...' : 'Loading...'}</span>}
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1.1fr 0.75fr 1.8fr', gap: 12, alignItems: 'end' }}>
+        <div>
+          <div style={labelStyle}>{th ? 'ค้นหาบริษัท' : 'Find company'}</div>
+          <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder={th ? 'พิมพ์ MOSHI, SCB, ชื่อบริษัท...' : 'Type MOSHI, SCB, company name...'} style={selectStyle} />
+        </div>
+        <div>
+          <div style={labelStyle}>{th ? 'บริษัท' : 'Company'}</div>
+          <select value={companyId} onChange={(e) => onCompanyChange?.(Number(e.target.value))} style={selectStyle}>
+            {filteredCompanies.map((company) => <option key={company.id} value={company.id}>{company.tickerSymbol ? `${company.tickerSymbol} — ` : ''}{th ? company.nameTh : company.nameEn}</option>)}
+          </select>
+        </div>
+        <div>
+          <div style={labelStyle}>{th ? 'ปี' : 'FY'}</div>
+          <select value={selectedYearNumber} onChange={(e) => onYearChange?.(Number(e.target.value))} style={selectStyle}>
+            {historyYears.length ? historyYears.map((year) => <option key={year} value={year}>{year} {th ? `(พ.ศ.${year + 543})` : ''}</option>) : <option value={selectedYearNumber}>{selectedYearNumber}</option>}
+          </select>
+        </div>
+        <div>
+          <div style={labelStyle}>{th ? 'ไฟล์ / Batch' : 'File / Batch'}</div>
+          <select value={selectedBatchId || 'latest'} onChange={(e) => onSelectSnapshot?.({ batchId: e.target.value, companyId, fiscalYear: selectedYearNumber })} style={selectStyle}>
+            <option value="latest">{th ? 'Latest confirmed — ใช้ข้อมูลล่าสุดของปีที่เลือก' : 'Latest confirmed — current active data'}</option>
+            {yearBatches.map((row) => (
+              <option key={row.id} value={row.id}>
+                {formatBatchDate(row.imported_at, th)} — {row.file_name || 'uploaded file'} — {row.status || 'confirmed'} — {Number(row.total_rows || 0).toLocaleString()} rows
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      <div style={{ marginTop: 14, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: 10 }}>
+        <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 10, padding: 11 }}>
+          <div style={labelStyle}>{th ? 'แหล่งข้อมูลที่แสดงอยู่' : 'Current data source'}</div>
+          <div style={{ fontSize: 13, fontWeight: 900, color: C.text, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={activeSource?.file_name || currentPeriodMeta?._sourceFile || ''}>
+            {activeSource?.file_name || currentPeriodMeta?._sourceFile || (th ? 'ยังไม่พบ batch source' : 'No batch source detected')}
+          </div>
+        </div>
+        <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 10, padding: 11 }}>
+          <div style={labelStyle}>Batch</div>
+          <div style={{ fontSize: 12, color: C.muted, wordBreak: 'break-all' }}>{activeSource?.id || currentPeriodMeta?.import_batch_id || '-'}</div>
+        </div>
+        <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 10, padding: 11 }}>
+          <div style={labelStyle}>Rows / Review</div>
+          <div style={{ fontSize: 13, fontWeight: 900, color: reviewRows > 0 ? C.amber : C.green }}>{Number(sourceRows || 0).toLocaleString()} / {Number(reviewRows || 0).toLocaleString()}</div>
+        </div>
+        <div style={{ background: isArchived ? C.amberLo : C.bg, border: `1px solid ${isArchived ? C.amber : C.border}`, borderRadius: 10, padding: 11 }}>
+          <div style={labelStyle}>Status</div>
+          <div style={{ fontSize: 13, fontWeight: 900, color: isArchived ? C.amber : C.green }}>
+            {isArchived ? `⚠ ${activeSource.status} — ${th ? 'ใช้ตรวจย้อนหลังเท่านั้น' : 'archived only'}` : (activeSource?.status || currentPeriodMeta?._batchStatus || 'confirmed')}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function MomentumDashboard({
+  store,
+  companyId,
+  selectedYear,
+  lang,
+  C,
+  COMPANIES,
+  importHistory = [],
+  selectedBatchId = 'latest',
+  sourceMeta = null,
+  finderLoading = false,
+  onCompanyChange,
+  onYearChange,
+  onSelectSnapshot,
+}) {
   const th = lang === "th";
   const company = COMPANIES.find(c => c.id === companyId) || COMPANIES[0];
   const cur = company?.currency || "THB";
@@ -202,13 +353,25 @@ export default function MomentumDashboard({ store, companyId, lang, C, COMPANIES
   const compStore = store?.[companyId] || {};
   const yearsDesc = Object.keys(compStore).map(Number).sort((a, b) => b - a);
   const yearsAsc = [...yearsDesc].reverse();
-  const currentYear = yearsDesc[0] || new Date().getFullYear();
+  const requestedYear = Number(selectedYear) || null;
+  const latestYear = yearsDesc[0] || new Date().getFullYear();
+  const currentYear = requestedYear && yearsDesc.includes(requestedYear) ? requestedYear : latestYear;
+  const isYearFallback = Boolean(requestedYear && yearsDesc.length && requestedYear !== currentYear);
   const displayYear = (y) => th ? y + 543 : y;
+  const availablePeriods = useMemo(() => {
+    const periodKeys = Object.keys(compStore?.[currentYear] || {}).filter((key) => compStore[currentYear]?.[key]?.groups);
+    return periodKeys.length ? periodKeys : ['FY'];
+  }, [compStore, currentYear]);
+
+  useEffect(() => {
+    if (availablePeriods.length && !availablePeriods.includes(periodFilter)) setPeriodFilter(availablePeriods[0]);
+  }, [availablePeriods, periodFilter]);
 
   const insights = useMemo(() => generateInsights(store, companyId, currentYear), [store, companyId, currentYear]);
 
   const chartData = useMemo(() => yearsAsc.map(y => {
-    const groups = compStore[y]?.[periodFilter]?.groups || compStore[y]?.FY?.groups || {};
+    const activePeriod = availablePeriods.includes(periodFilter) ? periodFilter : (Object.keys(compStore[y] || {}).find((key) => compStore[y]?.[key]?.groups) || 'FY');
+    const groups = compStore[y]?.[activePeriod]?.groups || compStore[y]?.FY?.groups || {};
     const m = getMetrics(groups);
     return {
       year: String(displayYear(y)),
@@ -221,7 +384,7 @@ export default function MomentumDashboard({ store, companyId, lang, C, COMPANIES
       assetShort: m.currentAssets,
       assetLong: m.nonCurrentAssets,
     };
-  }), [compStore, yearsAsc, periodFilter, th]);
+  }), [compStore, yearsAsc, periodFilter, availablePeriods, th]);
 
   if (!yearsDesc.length) {
     return <div style={{ padding: 40, textAlign: 'center', color: C.muted }}>{th ? "ไม่มีข้อมูลสำหรับบริษัทนี้ โปรดอัปโหลดงบการเงิน" : "No data available. Please upload financial statements."}</div>;
@@ -231,6 +394,8 @@ export default function MomentumDashboard({ store, companyId, lang, C, COMPANIES
   const prevGroups = compStore[currentYear - 1]?.[periodFilter]?.groups || compStore[currentYear - 1]?.FY?.groups || {};
   const curr = getMetrics(currGroups);
   const prev = getMetrics(prevGroups);
+  const hasCoreMetrics = Boolean(curr.revenue || curr.netProfit || curr.asset || curr.liability || curr.equity);
+  const currentPeriodMeta = compStore[currentYear]?.[periodFilter] || compStore[currentYear]?.FY || {};
 
   const revGrowth = calculateGrowth(curr.revenue, prev.revenue);
   const profitGrowth = calculateGrowth(curr.netProfit, prev.netProfit);
@@ -261,21 +426,47 @@ export default function MomentumDashboard({ store, companyId, lang, C, COMPANIES
 
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: 24 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: 18 }}>
         <div>
           <div style={{ fontSize: 24, fontWeight: 800 }}>{th ? "ระบบวิเคราะห์งบการเงิน" : "Financial Analytics Engine"}</div>
           <div style={{ fontSize: 14, color: C.muted }}>{company?.nameTh} ({company?.tickerSymbol})</div>
         </div>
         <select value={periodFilter} onChange={e => setPeriodFilter(e.target.value)} style={{ padding: "8px 12px", borderRadius: 8, background: C.surface, color: C.text, border: `1px solid ${C.border}`, outline: 'none' }}>
-          <option value="FY">Annual (FY)</option>
-          <option value="Q1">Quarter 1 (Q1)</option>
-          <option value="Q2">Quarter 2 (Q2)</option>
-          <option value="Q3">Quarter 3 (Q3)</option>
-          <option value="Q4">Quarter 4 (Q4)</option>
-          <option value="6M">Half Year (6M)</option>
-          <option value="9M">9 Months (9M)</option>
+          {availablePeriods.map((period) => (
+            <option key={period} value={period}>{period === 'FY' ? 'Annual (FY)' : period}</option>
+          ))}
         </select>
       </div>
+
+      <DashboardDataFinder
+        C={C}
+        th={th}
+        companies={COMPANIES}
+        companyId={companyId}
+        selectedYear={currentYear}
+        importHistory={importHistory}
+        selectedBatchId={selectedBatchId}
+        currentPeriodMeta={currentPeriodMeta}
+        sourceMeta={sourceMeta}
+        finderLoading={finderLoading}
+        onCompanyChange={onCompanyChange}
+        onYearChange={onYearChange}
+        onSelectSnapshot={onSelectSnapshot}
+      />
+
+      {isYearFallback && (
+        <div style={{ background: C.amberLo, border: `1px solid ${C.amber}`, borderRadius: 12, padding: 14, marginBottom: 16, color: C.text, fontSize: 13, lineHeight: 1.6 }}>
+          <b style={{ color: C.amber }}>⚠ {th ? 'ปีที่เลือกยังไม่มีข้อมูลงบ' : 'Selected FY has no data'}:</b>{' '}
+          {th ? `ระบบจึงแสดงปีล่าสุดที่มีข้อมูลคือ ${displayYear(currentYear)}` : `Showing latest available FY ${currentYear} instead.`}
+        </div>
+      )}
+      {!isYearFallback && !hasCoreMetrics && (
+        <div style={{ background: C.amberLo, border: `1px solid ${C.amber}`, borderRadius: 12, padding: 14, marginBottom: 16, color: C.text, fontSize: 13, lineHeight: 1.6 }}>
+          <b style={{ color: C.amber }}>⚠ {th ? 'พบข้อมูลนำเข้า แต่ยังไม่มี Core Metrics' : 'Imported rows found, but no core metrics yet'}:</b>{' '}
+          {th ? 'ไฟล์ปีนี้อาจเป็นงบคนละบริษัท, เลือกบริษัทผิด, ปีผิด หรือรายการหลักเช่น Revenue / Net Profit / Assets ยังอยู่ใน Review/Other' : 'The selected FY may belong to another company, wrong company selection/year, or key accounts are still Review/Other.'}
+          {Number(currentPeriodMeta.review_count || 0) > 0 ? ` (${currentPeriodMeta.review_count} Review rows)` : ''}
+        </div>
+      )}
 
       <div style={{ marginBottom: 24, display: 'flex', flexDirection: 'column', gap: 12 }}>
         <div style={{ fontSize: 16, fontWeight: 700 }}>{th ? "AI Insights & Anomalies" : "AI Insights & Anomalies"}</div>
@@ -319,7 +510,7 @@ export default function MomentumDashboard({ store, companyId, lang, C, COMPANIES
           </div>
         </SectionCard>
 
-        <SectionCard C={C} title={th ? "อัตรารายได้ต่อกำไร" : "Profit Bridge"} subtitle={th ? "แสดงตัวขับเคลื่อนจากรายได้ไปสู่กำไรสุทธิของปีล่าสุด" : "Revenue-to-net-profit bridge for the latest FY"}>
+        <SectionCard C={C} title={th ? "อัตรารายได้ต่อกำไร" : "Profit Bridge"} subtitle={th ? `แสดงตัวขับเคลื่อนจากรายได้ไปสู่กำไรสุทธิของปี ${displayYear(currentYear)}` : `Revenue-to-net-profit bridge for FY ${currentYear}`}>
           <div style={{ height: 300 }}>
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={latestBridge} margin={{ top: 10, right: 10, left: 0, bottom: 16 }}>

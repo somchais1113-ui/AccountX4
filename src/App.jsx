@@ -9,7 +9,7 @@ import { normalizeFinancialCSV } from "./lib/csv.js";
 import { exportBackup, exportRecordsCSV, parseBackup } from "./lib/backup.js";
 import {
   isSupabaseConfigured, supabase, signIn, signUp, resetPassword, signOut,
-  loadCompanies, createCompany, updateCompany, loadAllFinancialData, saveImportBatch, savePrivateImportBatch, loadExchangeRates, saveExchangeRate,
+  loadCompanies, createCompany, updateCompany, loadAllFinancialData, loadFinancialDataSnapshot, saveImportBatch, savePrivateImportBatch, loadExchangeRates, saveExchangeRate,
   loadAuditLog, loadCompanyMembers, grantCompanyAccess, revokeCompanyAccess,
   loadImportHistory, loadImportBatchRows, rollbackImportBatch, getRawFileSignedUrl,
   loadMappingReviewRows, updateMappingForRawAccount,
@@ -1560,7 +1560,7 @@ function AuditPage({lang}) {
 }
 
 
-function ImportHistoryPage({ companyId, companies, onRefresh, lang }) {
+function ImportHistoryPage({ companyId, companies, onRefresh, onOpenDashboard, lang }) {
   const C = useC();
   const th = lang === "th";
   const [rows, setRows] = useState([]);
@@ -1634,8 +1634,9 @@ function ImportHistoryPage({ companyId, companies, onRefresh, lang }) {
                   <td style={{padding:11,textAlign:"right",color:Number(row.review_count)>0?C.amber:C.green}}>{row.review_count ?? 0}</td>
                   <td style={{padding:11}}><Badge color={statusColor(row.status)}>{row.status || "confirmed"}</Badge></td>
                   <td style={{padding:11}}>{row.storage_path ? <button onClick={()=>downloadRaw(row)} style={{border:"none",background:C.blueLo,color:C.blue,borderRadius:8,padding:"7px 9px",cursor:"pointer"}}>{formatSize(row.file_size)}</button> : <span style={{color:C.muted}}>-</span>}</td>
-                  <td style={{padding:11,display:"flex",gap:8}}>
+                  <td style={{padding:11,display:"flex",gap:8,flexWrap:"wrap"}}>
                     <button onClick={()=>openDetails(row)} style={{border:"none",background:C.accentLo,color:C.accent,borderRadius:8,padding:"7px 10px",cursor:"pointer"}}>{th?"ดู":"View"}</button>
+                    <button onClick={()=>onOpenDashboard?.(row)} style={{border:"none",background:C.greenLo,color:C.green,borderRadius:8,padding:"7px 10px",cursor:"pointer"}}>{th?"เปิด Dash":"Open Dash"}</button>
                     {row.status === 'confirmed' && <button disabled={busy} onClick={()=>rollback(row)} style={{border:"none",background:C.redLo,color:C.red,borderRadius:8,padding:"7px 10px",cursor:busy?"wait":"pointer"}}>{th?"Rollback":"Rollback"}</button>}
                   </td>
                 </tr>
@@ -1720,39 +1721,98 @@ function MappingCenterPage({ companyId, lang, onRefresh }) {
   const [rows, setRows] = useState([]);
   const [status, setStatus] = useState({loading:true,error:""});
   const [savingId, setSavingId] = useState(null);
-  const groupOptions = Object.keys(METRIC_GROUPS).concat(['gross_profit','other_income','other_current_assets','other_current_liabilities','other']).sort();
+  const [draftGroups, setDraftGroups] = useState({});
+  const extraGroups = [
+    'gross_profit','sales_revenue','product_sales_revenue','service_revenue','other_income','finance_income','dividend_income',
+    'cogs','sga','expense','finance_cost','tax','net_profit','profit_before_tax','operating_profit',
+    'asset','liability','equity','cash','inventory','receivable','payable','loan',
+    'deferred_tax_assets','deferred_tax_liabilities','legal_reserve','retained_earnings','share_capital','share_premium',
+    'other_comprehensive_income','total_comprehensive_income','oci_cash_flow_hedge','non_controlling_interests',
+    'operating_cash_flow','investing_cash_flow','financing_cash_flow','other'
+  ];
+  const groupOptions = Array.from(new Set([
+    ...Object.values(METRIC_GROUPS).flat(),
+    ...extraGroups,
+    ...rows.map(row => row.account_group).filter(Boolean),
+    ...rows.map(row => row.suggested_account_group).filter(Boolean),
+  ])).sort();
   const load = async () => {
     if (!isSupabaseConfigured) { setStatus({loading:false,error:th?"ต้องเชื่อม Supabase ก่อน":"Supabase is required"}); return; }
     setStatus({loading:true,error:""});
-    try { setRows(await loadMappingReviewRows(companyId, 500)); setStatus({loading:false,error:""}); }
+    try {
+      const nextRows = await loadMappingReviewRows(companyId, 500);
+      setRows(nextRows);
+      const initialDrafts = {};
+      nextRows.forEach(row => { initialDrafts[row.id] = row.suggested_account_group || row.account_group || 'other'; });
+      setDraftGroups(initialDrafts);
+      setStatus({loading:false,error:""});
+    }
     catch(error){ setStatus({loading:false,error:error.message}); }
   };
   useEffect(()=>{ load(); },[companyId,lang]);
-  const save = async (row, group) => {
+  const sourceLabel = (source) => ({
+    approved_mapping: th ? 'Approved' : 'Approved',
+    accounting_dictionary: th ? 'Dictionary' : 'Dictionary',
+    ai_similarity: th ? 'AI Similarity' : 'AI Similarity',
+    parser_rule: th ? 'Parser' : 'Parser',
+    unknown: th ? 'Unknown' : 'Unknown',
+  }[source || 'unknown'] || source || 'unknown');
+  const sourceColor = (source) => ({
+    approved_mapping: C.green,
+    accounting_dictionary: C.amber,
+    ai_similarity: C.purple,
+    parser_rule: C.accent,
+    unknown: C.red,
+  }[source || 'unknown'] || C.muted);
+  const save = async (row) => {
+    const group = draftGroups[row.id] || row.suggested_account_group || row.account_group || 'other';
     setSavingId(row.id);
     try {
-      await updateMappingForRawAccount({ companyId: row.company_id, rawAccountName: row.raw_account_name, statementType: row.statement_type, accountGroup: group });
+      await updateMappingForRawAccount({ companyId: row.company_id, rawAccountName: row.raw_account_name, statementType: row.statement_type, accountGroup: group, accountSubgroup: row.suggested_account_subgroup || row.account_subgroup || group });
       await load(); await onRefresh?.();
     } catch(error) { alert(error.message); }
     finally { setSavingId(null); }
   };
   return (
     <div>
-      <PageHeader title={th?"Account Mapping Center":"Account Mapping Center"} subtitle={th?"จัดการรายการบัญชีที่ระบบยังไม่มั่นใจ และจำ mapping ไว้ใช้ครั้งต่อไป":"Review low-confidence mappings and persist them for future imports"}/>
+      <PageHeader title={th?"Account Mapping Center":"Account Mapping Center"} subtitle={th?"AI ช่วยเสนอหมวดบัญชีให้ แต่ทุกแถวที่ไม่ใช่ approved mapping ต้องกดยืนยันก่อนนำไปจำใช้ครั้งต่อไป":"AI can suggest accounting categories, but non-approved suggestions require human confirmation"}/>
+      <Card style={{padding:16,marginBottom:16,border:`1px solid ${C.amber}`}}>
+        <div style={{fontWeight:900,color:C.amber,marginBottom:6}}>⚠ {th?"หลักความปลอดภัยของ Mapping":"Mapping safety rule"}</div>
+        <div style={{color:C.muted,fontSize:13,lineHeight:1.6}}>
+          {th?"ระบบสามารถ auto-select หมวดที่แนะนำไว้ใน dropdown ได้ แต่จะยังถือเป็น Review จนกว่าคุณจะกด Confirm / Approve เอง หลังอนุมัติแล้วระบบจึงจำเป็น approved mapping สำหรับไฟล์รอบถัดไป":"The system may preselect a suggested category in the dropdown, but it remains under Review until you click Confirm / Approve. After approval, it becomes a reusable approved mapping for future imports."}
+        </div>
+      </Card>
       <Card style={{padding:0,overflow:"hidden"}}>
         {status.loading ? <div style={{padding:20}}>{th?"กำลังโหลด...":"Loading..."}</div> : status.error ? <div style={{padding:20,color:C.red}}>{status.error}</div> : rows.length === 0 ? <div style={{padding:24,textAlign:"center",color:C.green,fontWeight:900}}>{th?"ไม่มีรายการที่ต้องแก้ไข":"No mapping issues found"}</div> : (
           <div style={{overflowX:"auto"}}>
-            <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:980}}>
-              <thead><tr>{[th?"บริษัท":"Company",th?"ปี":"Year",th?"งบ":"Statement",th?"ชื่อบัญชีจากไฟล์":"Raw account",th?"กลุ่มปัจจุบัน":"Current group",th?"Confidence":"Confidence",th?"แก้เป็น":"Map to"].map(h=><th key={h} style={{textAlign:"left",padding:11,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
-              <tbody>{rows.map(row => <tr key={row.id} style={{borderBottom:`1px solid ${C.border}`}}>
-                <td style={{padding:11}}>{row.companies?.ticker_symbol || row.company_id}</td>
-                <td style={{padding:11}}>{row.fiscal_year}</td>
-                <td style={{padding:11,color:C.muted}}>{row.statement_type}</td>
-                <td style={{padding:11,fontWeight:700}}>{row.raw_account_name}</td>
-                <td style={{padding:11}}><Badge color={row.account_group === 'other' ? C.amber : C.accent}>{row.account_group}</Badge></td>
-                <td style={{padding:11,color:(Number(row.mapping_confidence)||0) >= 0.9 ? C.green : C.amber}}>{row.mapping_confidence ?? '-'}</td>
-                <td style={{padding:11}}><select disabled={savingId===row.id} value={row.account_group || 'other'} onChange={(e)=>save(row,e.target.value)} style={{background:C.bg,border:`1px solid ${C.border}`,color:C.text,borderRadius:8,padding:"8px 10px",minWidth:180}}>{groupOptions.map(g=><option key={g} value={g}>{g}</option>)}</select></td>
-              </tr>)}</tbody>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:1220}}>
+              <thead><tr>{[th?"สถานะ":"Status",th?"บริษัท":"Company",th?"ปี":"Year",th?"งบ":"Statement",th?"ชื่อบัญชีจากไฟล์":"Raw account",th?"Source":"Source",th?"Confidence":"Confidence",th?"AI/Suggested category":"AI/Suggested category",th?"Confirm":"Confirm"].map(h=><th key={h} style={{textAlign:"left",padding:11,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
+              <tbody>{rows.map(row => {
+                const selectedGroup = draftGroups[row.id] || row.suggested_account_group || row.account_group || 'other';
+                const isApproved = row.mapping_source === 'approved_mapping' && row.needs_review === false;
+                return <tr key={row.id} style={{borderBottom:`1px solid ${C.border}`,background:isApproved ? 'transparent' : C.amberLo}}>
+                  <td style={{padding:11,color:isApproved ? C.green : C.amber,fontWeight:900}}>{isApproved ? '✓ OK' : '⚠ Review'}</td>
+                  <td style={{padding:11}}>{row.companies?.ticker_symbol || row.company_id}</td>
+                  <td style={{padding:11}}>{row.fiscal_year}</td>
+                  <td style={{padding:11,color:C.muted}}>{row.statement_type}</td>
+                  <td style={{padding:11,fontWeight:700,maxWidth:320}}>
+                    <div>{row.raw_account_name}</div>
+                    {row.review_reason ? <div style={{color:C.muted,fontSize:11,marginTop:4}}>{row.review_reason}</div> : null}
+                  </td>
+                  <td style={{padding:11}}><Badge color={sourceColor(row.mapping_source)}>{sourceLabel(row.mapping_source)}</Badge></td>
+                  <td style={{padding:11,color:(Number(row.mapping_confidence)||0) >= 0.9 ? C.green : C.amber}}>{row.mapping_confidence ?? '-'}</td>
+                  <td style={{padding:11}}>
+                    <select disabled={savingId===row.id} value={selectedGroup} onChange={(e)=>setDraftGroups(prev=>({...prev,[row.id]:e.target.value}))} style={{background:C.bg,border:`1px solid ${isApproved ? C.border : C.amber}`,color:C.text,borderRadius:8,padding:"8px 10px",minWidth:220}}>
+                      {groupOptions.map(g=><option key={g} value={g}>{g}</option>)}
+                    </select>
+                  </td>
+                  <td style={{padding:11}}>
+                    <button disabled={savingId===row.id} onClick={()=>save(row)} style={{background:C.green,color:'#06130F',border:0,borderRadius:8,padding:'8px 12px',fontWeight:900,cursor:'pointer'}}>
+                      {savingId===row.id ? (th?'กำลังบันทึก...':'Saving...') : (th?'Confirm':'Approve')}
+                    </button>
+                  </td>
+                </tr>;
+              })}</tbody>
             </table>
           </div>
         )}
@@ -1984,11 +2044,31 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(isSupabaseConfigured);
   const [dataLoading, setDataLoading] = useState(isSupabaseConfigured);
   const [appError, setAppError] = useState("");
+  const [importHistory, setImportHistory] = useState([]);
+  const [dashboardSnapshotId, setDashboardSnapshotId] = useState('latest');
+  const [dashboardSnapshotStore, setDashboardSnapshotStore] = useState(null);
+  const [dashboardSourceMeta, setDashboardSourceMeta] = useState(null);
+  const [dashboardFinderLoading, setDashboardFinderLoading] = useState(false);
 
   const C = THEMES[theme];
   const th = lang==="th";
   COMPANIES = companies;
   const company = COMPANIES.find(c=>c.id===companyId);
+  const yearOptions = useMemo(() => {
+    const current = new Date().getFullYear();
+    const storeYears = Object.keys(store?.[companyId] || {}).map(Number).filter(Boolean);
+    const historyYears = importHistory
+      .filter((row) => Number(row.company_id) === Number(companyId))
+      .map((row) => Number(row.fiscal_year))
+      .filter(Boolean);
+    return Array.from(new Set([...storeYears, ...historyYears, current - 3, current - 2, current - 1, current])).sort((a, b) => a - b);
+  }, [store, importHistory, companyId]);
+
+  const resetDashboardSnapshot = () => {
+    setDashboardSnapshotId('latest');
+    setDashboardSnapshotStore(null);
+    setDashboardSourceMeta(null);
+  };
 
   useEffect(() => {
     if (isSupabaseConfigured) return;
@@ -2024,6 +2104,7 @@ export default function App() {
         }
       });
       setExchangeRates({THB:1});
+      setImportHistory([]);
       setCompanyId(1);
       setDataLoading(false);
       return;
@@ -2032,13 +2113,24 @@ export default function App() {
     if (!isSupabaseConfigured) return;
     setDataLoading(true); setAppError("");
     try {
-      const [nextCompanies,nextStore,nextRates] = await Promise.all([
-        loadCompanies(), loadAllFinancialData(), loadExchangeRates(year),
+      const [nextCompanies,nextStore,nextRates,nextHistory] = await Promise.all([
+        loadCompanies(),
+        loadAllFinancialData(),
+        loadExchangeRates(year),
+        loadImportHistory(null, 500).catch(() => []),
       ]);
       setCompanies(nextCompanies);
       setStore(nextStore);
       setExchangeRates(nextRates);
-      if (nextCompanies.length && !nextCompanies.some(item=>item.id===companyId)) setCompanyId(nextCompanies[0].id);
+      setImportHistory(nextHistory || []);
+      if (dashboardSnapshotId === 'latest') {
+        setDashboardSnapshotStore(null);
+        setDashboardSourceMeta(null);
+      }
+      if (nextCompanies.length && !nextCompanies.some(item=>item.id===companyId)) {
+        setCompanyId(nextCompanies[0].id);
+        resetDashboardSnapshot();
+      }
     } catch (error) { setAppError(error.message); }
     finally { setDataLoading(false); }
   };
@@ -2051,12 +2143,46 @@ export default function App() {
       const result = isPrivatePayload
         ? await savePrivateImportBatch(companyId, batchDetails, rowsOrPayload)
         : await saveImportBatch(companyId, batchDetails, rowsOrPayload);
+      resetDashboardSnapshot();
       if (batchDetails?.fiscalYear) setYear(Number(batchDetails.fiscalYear));
       await refreshRemoteData();
       return result;
     }
     // Fallback for local demo mode not supported in V1 for normalized data fully yet
     throw new Error("Local demo mode not fully supported for multi-year normalized data in V1.");
+  };
+
+  const handleDashboardCompanyChange = (nextCompanyId) => {
+    setCompanyId(Number(nextCompanyId));
+    resetDashboardSnapshot();
+  };
+
+  const handleDashboardYearChange = (nextYear) => {
+    setYear(Number(nextYear));
+    resetDashboardSnapshot();
+  };
+
+  const handleDashboardSnapshotChange = async ({ batchId, companyId: nextCompanyId, fiscalYear } = {}) => {
+    if (nextCompanyId) setCompanyId(Number(nextCompanyId));
+    if (fiscalYear) setYear(Number(fiscalYear));
+    if (!batchId || batchId === 'latest') {
+      resetDashboardSnapshot();
+      return;
+    }
+    setDashboardFinderLoading(true);
+    setAppError('');
+    try {
+      const snapshot = await loadFinancialDataSnapshot(batchId);
+      setDashboardSnapshotId(batchId);
+      setDashboardSnapshotStore(snapshot.store || {});
+      setDashboardSourceMeta({ ...(snapshot.batch || {}), rowCounts: snapshot.rowCounts || {}, mode: snapshot.mode || 'snapshot' });
+      if (snapshot.batch?.company_id) setCompanyId(Number(snapshot.batch.company_id));
+      if (snapshot.batch?.fiscal_year) setYear(Number(snapshot.batch.fiscal_year));
+    } catch (error) {
+      setAppError(error.message || String(error));
+    } finally {
+      setDashboardFinderLoading(false);
+    }
   };
 
   const handleSaveRate = async (currency,rate) => {
@@ -2165,7 +2291,23 @@ export default function App() {
   };
 
   const renderPage = () => {
-    if (page==="momentum") return <MomentumDashboard store={store} companyId={companyId} lang={lang} C={C} COMPANIES={companies} INDUSTRIES={INDUSTRIES}/>;
+    const dashboardStore = dashboardSnapshotStore || store;
+    if (page==="momentum") return <MomentumDashboard
+      store={dashboardStore}
+      companyId={companyId}
+      selectedYear={year}
+      lang={lang}
+      C={C}
+      COMPANIES={companies}
+      INDUSTRIES={INDUSTRIES}
+      importHistory={importHistory}
+      selectedBatchId={dashboardSnapshotId}
+      sourceMeta={dashboardSourceMeta}
+      finderLoading={dashboardFinderLoading}
+      onCompanyChange={handleDashboardCompanyChange}
+      onYearChange={handleDashboardYearChange}
+      onSelectSnapshot={handleDashboardSnapshotChange}
+    />;
     if (page==="upload") return <ImportWizard companyId={companyId} company={company} onImportSuccess={handleUpsert} lang={lang} theme={theme} C={C} />;
     if (page==="data") return <DataManagerPage store={store} companyId={companyId} year={year} lang={lang}/>;
     if (page==="companies") return <CompaniesPage store={store} year={year} lang={lang} onSelect={(id)=>{setCompanyId(id);setPage("momentum");}} onCompare={(ids)=>{setCompareIds(ids);setPage("compare");}}/>;
@@ -2174,7 +2316,7 @@ export default function App() {
     if (page==="consolidation") return <ConsolidationPage store={store} year={year} lang={lang} exchangeRates={exchangeRates} onSaveRate={handleSaveRate}/>;
     if (page==="slides") return <SlideViewer store={store} companyId={companyId} year={year} lang={lang} theme={theme} onImportSuccess={handleUpsert} onGoUpload={()=>setPage("upload")}/>;
     if (page==="access") return <AccessPage companyId={companyId} lang={lang}/>;
-    if (page==="imports") return <ImportHistoryPage companyId={companyId} companies={companies} onRefresh={refreshRemoteData} lang={lang}/>;
+    if (page==="imports") return <ImportHistoryPage companyId={companyId} companies={companies} onRefresh={refreshRemoteData} onOpenDashboard={(row)=>{ setPage('momentum'); handleDashboardSnapshotChange({ batchId: row.id, companyId: row.company_id, fiscalYear: row.fiscal_year }); }} lang={lang}/>;
     if (page==="quality") return <DataQualityPage store={store} companyId={companyId} lang={lang}/>;
     if (page==="mapping") return <MappingCenterPage companyId={companyId} lang={lang} onRefresh={refreshRemoteData}/>;
     if (page==="alerts") return <AlertCenterPage companyId={companyId} companies={companies} lang={lang}/>;
@@ -2248,11 +2390,11 @@ export default function App() {
             options={[{value:"dark",icon:"🌙",label:th?"มืด":"Dark"},{value:"light",icon:"☀️",label:th?"สว่าง":"Light"}]}
           />
           <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:6,fontWeight:700}}>{th?"บริษัท":"Company"}</div>
-          <select value={companyId} onChange={e=>setCompanyId(Number(e.target.value))} style={{...selStyle,marginBottom:8}}>
+          <select value={companyId} onChange={e=>handleDashboardCompanyChange(Number(e.target.value))} style={{...selStyle,marginBottom:8}}>
             {COMPANIES.map(c=>(<option key={c.id} value={c.id}>{th?c.nameTh:c.nameEn}</option>))}
           </select>
-          <select value={year} onChange={e=>setYear(Number(e.target.value))} style={selStyle}>
-            {[2023,2024,2025,2026].map(y=>(<option key={y} value={y}>{y} (พ.ศ.{y+543})</option>))}
+          <select value={year} onChange={e=>handleDashboardYearChange(Number(e.target.value))} style={selStyle}>
+            {yearOptions.map(y=>(<option key={y} value={y}>{y} (พ.ศ.{y+543})</option>))}
           </select>
           <SegmentedToggle
             value={lang}

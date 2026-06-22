@@ -78,7 +78,7 @@ export const CORE_GROUPS = {
   investment_property: ['อสังหาริมทรัพย์เพื่อการลงทุน', 'investment property'],
   right_of_use_assets: ['สินทรัพย์สิทธิการใช้', 'right-of-use assets'],
   intangible_assets: ['สินทรัพย์ไม่มีตัวตน', 'intangible assets'],
-  deferred_tax_assets: ['สินทรัพย์ภาษีเงินได้รอการตัดบัญชี', 'deferred tax assets'],
+  deferred_tax_assets: ['สินทรัพย์ภาษีเงินได้รอการตัดบัญชี', 'สินทรัพย์ภาษีเงินได้รอตัดบัญชี', 'deferred tax assets'],
   deposits: ['เงินประกัน', 'deposits'],
   total_non_current_assets: ['รวมสินทรัพย์ไม่หมุนเวียน', 'total non-current assets'],
   contract_liabilities: ['หนี้สินที่เกิดจากสัญญา', 'contract liabilities'],
@@ -102,8 +102,8 @@ export const CORE_GROUPS = {
   other_gain_loss: ['กำไร ขาดทุน อื่น สุทธิ', 'other gain loss'],
   profit_before_finance_tax: ['กำไรก่อนต้นทุนทางการเงินและภาษีเงินได้', 'profit before finance cost and tax'],
   profit_before_tax: ['กำไรก่อนภาษีเงินได้', 'profit before tax'],
-  other_comprehensive_income: ['กำไรขาดทุนเบ็ดเสร็จอื่น', 'other comprehensive income'],
-  total_comprehensive_income: ['กำไรขาดทุนเบ็ดเสร็จรวม', 'total comprehensive income'],
+  other_comprehensive_income: ['กำไรขาดทุนเบ็ดเสร็จอื่น', 'กําไรขาดทุนเบ็ดเสร็จอื่น', 'other comprehensive income'],
+  total_comprehensive_income: ['กำไรขาดทุนเบ็ดเสร็จรวม', 'กําไรขาดทุนเบ็ดเสร็จรวม', 'รวมกำไรขาดทุนเบ็ดเสร็จ', 'รวมกําไรขาดทุนเบ็ดเสร็จ', 'total comprehensive income'],
 
   // Supporting cash-flow groups
   depreciation: ['ค่าเสื่อมราคา', 'depreciation'],
@@ -172,6 +172,57 @@ function rowToText(row) {
 function keywordMatch(text, keywords) {
   const t = normalizeForMatch(text);
   return keywords.some((keyword) => t.includes(normalizeForMatch(keyword)));
+}
+
+
+const REVIEW_REQUIRED_SOURCES = new Set(['accounting_dictionary', 'ai_similarity', 'unknown']);
+
+function withMappingMeta(mapping, source = 'parser_rule', reviewReason = null) {
+  const cleanMapping = mapping || { group: 'other', subgroup: null, confidence: 0.3 };
+  return {
+    ...cleanMapping,
+    mapping_source: cleanMapping.mapping_source || source,
+    review_reason: cleanMapping.review_reason || reviewReason,
+  };
+}
+
+function shouldReviewMapping(mapping) {
+  if (!mapping) return true;
+  if (mapping.mapping_source === 'approved_mapping') return false;
+  if (REVIEW_REQUIRED_SOURCES.has(mapping.mapping_source)) return true;
+  return Number(mapping.confidence || 0) < 0.85 || mapping.group === 'other';
+}
+
+function reviewReasonForMapping(mapping) {
+  if (!mapping) return 'No mapping suggestion was available.';
+  if (mapping.review_reason) return mapping.review_reason;
+  if (mapping.mapping_source === 'accounting_dictionary') return 'Suggested from accounting dictionary; human confirmation required.';
+  if (mapping.mapping_source === 'ai_similarity') return 'Suggested from similar approved mapping; human confirmation required.';
+  if (mapping.mapping_source === 'unknown' || mapping.group === 'other') return 'Unknown or low-confidence accounting mapping.';
+  if (Number(mapping.confidence || 0) < 0.85) return 'Low confidence parser mapping.';
+  return null;
+}
+
+const ACCOUNTING_DICTIONARY_RULES = [
+  { any: ['สินทรัพย์ภาษีเงินได้รอตัดบัญชี', 'สินทรัพย์ภาษีเงินได้รอการตัดบัญชี', 'deferred tax assets'], group: 'deferred_tax_assets', subgroup: 'deferred_tax_assets', confidence: 0.92 },
+  { any: ['หนี้สินภาษีเงินได้รอตัดบัญชี', 'หนี้สินภาษีเงินได้รอการตัดบัญชี', 'deferred tax liabilities'], group: 'deferred_tax_liabilities', subgroup: 'deferred_tax_liabilities', confidence: 0.92 },
+  { any: ['กำไรสะสม', 'กําไรสะสม', 'retained earnings'], group: 'retained_earnings', subgroup: 'retained_earnings', confidence: 0.9 },
+  { any: ['สำรองตามกฎหมาย', 'สํารองตามกฎหมาย', 'ทุนสำรองตามกฎหมาย', 'ทุนสํารองตามกฎหมาย', 'legal reserve'], group: 'legal_reserve', subgroup: 'legal_reserve', confidence: 0.9 },
+  { any: ['กำไร (ขาดทุน) สุทธิ', 'กําไร (ขาดทุน) สุทธิ', 'กำไรขาดทุนสุทธิ', 'กําไรขาดทุนสุทธิ', 'กำไรสุทธิ', 'กําไรสุทธิ', 'ขาดทุนสุทธิ', 'net profit', 'net income'], group: 'net_profit', subgroup: 'net_profit', confidence: 0.94 },
+  { any: ['กำไรขาดทุนเบ็ดเสร็จอื่น', 'กําไรขาดทุนเบ็ดเสร็จอื่น', 'other comprehensive income'], group: 'other_comprehensive_income', subgroup: 'other_comprehensive_income', confidence: 0.9 },
+  { any: ['รวมกำไรขาดทุนเบ็ดเสร็จ', 'รวมกําไรขาดทุนเบ็ดเสร็จ', 'กำไรเบ็ดเสร็จรวมสำหรับปี', 'กําไรเบ็ดเสร็จรวมสําหรับปี', 'total comprehensive income'], group: 'total_comprehensive_income', subgroup: 'total_comprehensive_income', confidence: 0.9 },
+  { any: ['ส่วนได้เสียที่ไม่มีอำนาจควบคุม', 'ส่วนได้เสียที่ไม่มีอํานาจควบคุม', 'non-controlling interests', 'non controlling interests'], group: 'non_controlling_interests', subgroup: 'non_controlling_interests', confidence: 0.9 },
+  { any: ['สำรองรายการป้องกันความเสี่ยง', 'สํารองรายการป้องกันความเสี่ยง', 'สำรองรายการประกันความเสี่ยง', 'สํารองรายการประกันความเสี่ยง', 'cash flow hedge reserve', 'hedging reserve'], group: 'oci_cash_flow_hedge', subgroup: 'cash_flow_hedge_oci', confidence: 0.88 },
+  { any: ['การเปลี่ยนแปลงในสำรองรายการป้องกันความเสี่ยง', 'การเปลี่ยนแปลงในสํารองรายการป้องกันความเสี่ยง', 'การเปลี่ยนแปลงในสำรองรายการประกันความเสี่ยง', 'การเปลี่ยนแปลงในสํารองรายการประกันความเสี่ยง'], group: 'oci_cash_flow_hedge', subgroup: 'cash_flow_hedge_oci', confidence: 0.88 },
+  { all: ['กำไรจากการขายเงินลงทุน', 'มูลค่ายุติธรรม'], group: 'other_comprehensive_income', subgroup: 'fair_value_oci_investment_gain', confidence: 0.86 },
+  { all: ['กําไรจากการขายเงินลงทุน', 'มูลค่ายุติธรรม'], group: 'other_comprehensive_income', subgroup: 'fair_value_oci_investment_gain', confidence: 0.86 },
+  { any: ['โอนไปทุนสำรองตามกฎหมาย', 'โอนไปทุนสํารองตามกฎหมาย'], group: 'legal_reserve', subgroup: 'legal_reserve_transfer', confidence: 0.86 },
+  { any: ['โอนไปกำไรสะสม', 'โอนไปกําไรสะสม'], group: 'retained_earnings', subgroup: 'retained_earnings_transfer', confidence: 0.86 },
+];
+
+function dictionaryMapAccount(accountName) {
+  const matched = matchRule(normalizeForMatch(accountName), ACCOUNTING_DICTIONARY_RULES);
+  return matched ? withMappingMeta(matched, 'accounting_dictionary') : null;
 }
 
 function cleanAccountLabel(value) {
@@ -256,6 +307,33 @@ function detectUnit(text, fallback = { unit: 'baht', multiplier: 1 }) {
   if (t.includes('พันบาท') || t.includes('thousandbaht') || t.includes('thbthousand')) return { unit: 'thousand_baht', multiplier: 1000 };
   if (t.includes('บาท') || t.includes('baht') || t.includes('thb')) return { unit: 'baht', multiplier: 1 };
   return fallback;
+}
+
+
+function extractLikelyFiscalYearFromText(value) {
+  const t = normalizeText(value).replace(/,/g, ' ');
+  if (!t) return null;
+  const matches = [...t.matchAll(/(?:^|[^0-9])((?:25|20)[0-9]{2})(?:[^0-9]|$)/g)];
+  for (const match of matches) {
+    let year = Number(match[1]);
+    if (year >= 2400) year -= 543;
+    if (year >= 1990 && year <= 2035) return year;
+  }
+  return null;
+}
+
+function applyFileNameFiscalYearFallback(rows = [], fileName = '') {
+  const fileYear = extractLikelyFiscalYearFromText(fileName);
+  if (!fileYear || !rows.length) return rows;
+  const years = [...new Set(rows.map((row) => Number(row.fiscal_year)).filter(Number.isFinite))];
+  const currentYear = new Date().getFullYear();
+  // Some SET-style exports have weak/no year headers; in that case the parser may fall back to
+  // the current calendar year. If the file name clearly carries a fiscal year (e.g. SCB_2566),
+  // use it instead of silently saving the batch to the wrong FY.
+  if (years.length === 1 && years[0] === currentYear && fileYear !== currentYear) {
+    rows.forEach((row) => { row.fiscal_year = fileYear; });
+  }
+  return rows;
 }
 
 export function extractPeriodInfo(value) {
@@ -422,6 +500,7 @@ function matchRule(text, rules) {
       group: rule.group,
       subgroup: rule.subgroup || rule.group,
       confidence: rule.confidence ?? 0.9,
+      mapping_source: rule.mapping_source || 'parser_rule',
     };
   }
   return null;
@@ -674,22 +753,29 @@ function mapEquityComponent(component) {
 
 function autoMapAccount(accountName, statementType, section = '') {
   const label = normalizeText(accountName);
-  if (!label) return { group: 'other', subgroup: null, confidence: 0.3 };
+  if (!label) return withMappingMeta({ group: 'other', subgroup: null, confidence: 0.3 }, 'unknown', 'Blank account name.');
 
-  if (statementType === 'income_statement') return mapIncomeStatement(label, section) || { group: 'other', subgroup: 'income_statement_detail', confidence: 0.55 };
-  if (statementType === 'balance_sheet') return mapBalanceSheet(label, section) || { group: 'other', subgroup: 'balance_sheet_detail', confidence: 0.55 };
-  if (statementType === 'cash_flow') return mapCashFlow(label, section) || { group: 'other', subgroup: 'cash_flow_detail', confidence: 0.55 };
-  if (statementType === 'equity_statement') return { group: 'other', subgroup: 'equity_statement_detail', confidence: 0.55 };
+  const dictionaryMatch = dictionaryMapAccount(label);
+  let parserMatch = null;
+  if (statementType === 'income_statement') parserMatch = mapIncomeStatement(label, section);
+  else if (statementType === 'balance_sheet') parserMatch = mapBalanceSheet(label, section);
+  else if (statementType === 'cash_flow') parserMatch = mapCashFlow(label, section);
+  else if (statementType === 'equity_statement') parserMatch = { group: 'other', subgroup: 'equity_statement_detail', confidence: 0.55, mapping_source: 'unknown' };
+
+  // Keep existing high-confidence parser behavior for stable master files.
+  // Use the dictionary only when parser is missing/weak/Other so it can preselect a better suggestion with Review warning.
+  if (parserMatch && parserMatch.group !== 'other' && Number(parserMatch.confidence || 0) >= 0.9) return withMappingMeta(parserMatch, 'parser_rule');
+  if (dictionaryMatch && (!parserMatch || parserMatch.group === 'other' || Number(dictionaryMatch.confidence || 0) >= Number(parserMatch.confidence || 0))) return dictionaryMatch;
+  if (parserMatch) return withMappingMeta(parserMatch, 'parser_rule');
 
   // Generic fallback for simple CSV templates.
   const t = normalizeForMatch(label);
   for (const [group, keywords] of Object.entries(CORE_GROUPS)) {
-    if (keywords.some((keyword) => t === normalizeForMatch(keyword))) return { group, subgroup: group, confidence: 0.92 };
-    if (keywords.some((keyword) => t.includes(normalizeForMatch(keyword)))) return { group, subgroup: group, confidence: 0.72 };
+    if (keywords.some((keyword) => t === normalizeForMatch(keyword))) return withMappingMeta({ group, subgroup: group, confidence: 0.92 }, 'parser_rule');
+    if (keywords.some((keyword) => t.includes(normalizeForMatch(keyword)))) return withMappingMeta({ group, subgroup: group, confidence: 0.72 }, 'ai_similarity');
   }
-  return { group: 'other', subgroup: null, confidence: 0.5 };
+  return withMappingMeta({ group: 'other', subgroup: null, confidence: 0.5 }, 'unknown');
 }
-
 
 function removeOutOfWindowHistoricalRows(rows) {
   const reportingYears = rows
@@ -717,6 +803,10 @@ function promoteRevenueFallback(rows) {
     if (candidates.length === 1) {
       candidates[0].account_group = 'revenue';
       candidates[0].mapping_confidence = Math.max(candidates[0].mapping_confidence, 0.88);
+      candidates[0].mapping_source = candidates[0].mapping_source || 'parser_rule';
+      candidates[0].suggested_account_group = candidates[0].account_group;
+      candidates[0].suggested_account_subgroup = candidates[0].account_subgroup;
+      candidates[0].review_reason = null;
       candidates[0].needs_review = false;
     }
   });
@@ -844,7 +934,11 @@ function parseStandardStatementSheet(rows, sheetName, companyId, fileName) {
         section: currentSection,
         subsection: currentSubsection,
         mapping_confidence: mapping.confidence,
-        needs_review: mapping.confidence < 0.85 || mapping.group === 'other',
+        mapping_source: mapping.mapping_source || 'parser_rule',
+        suggested_account_group: mapping.group,
+        suggested_account_subgroup: mapping.subgroup || detectSubgroupFromText(sectionText),
+        review_reason: reviewReasonForMapping(mapping),
+        needs_review: shouldReviewMapping(mapping),
       });
     });
   }
@@ -905,6 +999,10 @@ function parseEquityStatementSheet(rows, sheetName, companyId, fileName) {
         section: 'งบการเปลี่ยนแปลงส่วนของเจ้าของ',
         subsection: component,
         mapping_confidence: mapEquityComponent(component).confidence,
+        mapping_source: 'parser_rule',
+        suggested_account_group: mapEquityComponent(component).group,
+        suggested_account_subgroup: mapEquityComponent(component).subgroup,
+        review_reason: null,
         needs_review: false,
       });
     }
@@ -916,6 +1014,7 @@ function makeSummary(rows, workbook, fileName) {
   const sheets = [...new Set(rows.map((row) => row.source_sheet))];
   const years = [...new Set(rows.map((row) => row.fiscal_year))].filter(Boolean).sort((a, b) => b - a);
   const statements = [...new Set(rows.map((row) => row.statement_type))].filter(Boolean);
+  const companyNames = [...new Set(rows.map((row) => normalizeText(row.company_name)).filter(Boolean))].slice(0, 6);
   const mappedCount = rows.filter((row) => !row.needs_review).length;
   const reviewCount = rows.length - mappedCount;
   return {
@@ -925,6 +1024,7 @@ function makeSummary(rows, workbook, fileName) {
     years,
     primaryYear: years[0] || new Date().getFullYear(),
     statements,
+    companyNames,
     rows: rows.length,
     mappedCount,
     reviewCount,
@@ -951,6 +1051,7 @@ export function parseFinancialWorkbook(workbook, companyId, fileName = '') {
     }
   }
 
+  applyFileNameFiscalYearFallback(results, fileName);
   const filteredResults = removeOutOfWindowHistoricalRows(results);
   promoteRevenueFallback(filteredResults);
   filteredResults.summary = makeSummary(filteredResults, workbook, fileName);

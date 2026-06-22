@@ -29,6 +29,30 @@ function sourceToParserType(sourceType) {
   return 'auto';
 }
 
+function normalizeCompanyText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[()（）.,\-–—_\s]+/g, '')
+    .replace(/บริษัท|จำกัด|จํากัด|มหาชน|public|company|limited|corporation|corp|plc|co|ltd/g, '')
+    .trim();
+}
+
+function getCompanyMismatchWarning(summary, company, th) {
+  const parsedNames = Array.isArray(summary?.companyNames) ? summary.companyNames.filter(Boolean) : [];
+  if (!parsedNames.length || !company) return null;
+  const selectedCandidates = [company.nameTh, company.nameEn, company.tickerSymbol].filter(Boolean);
+  const selectedNorms = selectedCandidates.map(normalizeCompanyText).filter(Boolean);
+  const parsedNorms = parsedNames.map(normalizeCompanyText).filter(Boolean);
+  if (!selectedNorms.length || !parsedNorms.length) return null;
+  const matches = parsedNorms.some(parsed => selectedNorms.some(selected => parsed.includes(selected) || selected.includes(parsed)));
+  if (matches) return null;
+  const selectedLabel = company.tickerSymbol || company.nameTh || company.nameEn || '-';
+  const parsedLabel = parsedNames.slice(0, 3).join(' / ');
+  return th
+    ? `ไฟล์นี้ดูเหมือนเป็นของ “${parsedLabel}” แต่ตอนนี้เลือกบริษัท “${selectedLabel}” อยู่ กรุณาเช็กก่อนบันทึก ไม่งั้น Dashboard ของบริษัทจะปนข้อมูลผิดบริษัท`
+    : `This file appears to belong to “${parsedLabel}”, but the selected company is “${selectedLabel}”. Check before saving to avoid mixing companies on the dashboard.`;
+}
+
 
 async function sha256File(file) {
   if (!file || !window.crypto?.subtle) return null;
@@ -309,6 +333,7 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
   }
 
   const groupOptions = Array.from(new Set([...Object.keys(CORE_GROUPS), ...parsedData.map(row => row.account_group).filter(Boolean)])).sort();
+  const companyMismatchWarning = getCompanyMismatchWarning(parseSummary, company, th);
 
   return (
     <div style={{ background: C.surface, borderRadius: 12, border: `1px solid ${C.border}`, padding: 24 }}>
@@ -332,11 +357,21 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
         </div>
       )}
 
+      {companyMismatchWarning && (
+        <div style={{ marginBottom: 16, padding: 14, borderRadius: 10, border: `1px solid ${C.amber}`, background: C.amberLo, color: C.text, fontWeight: 800, lineHeight: 1.6 }}>
+          ⚠ {companyMismatchWarning}
+        </div>
+      )}
+
       {parseSummary && (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 12, marginBottom: 18 }}>
           <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 10, padding: 12 }}>
             <div style={{ fontSize: 12, color: C.muted }}>{th ? 'ปีที่พบ' : 'Years'}</div>
             <div style={{ fontWeight: 800 }}>{parseSummary.years?.map(y => th ? y + 543 : y).join(', ') || '-'}</div>
+          </div>
+          <div style={{ background: C.bg, border: `1px solid ${companyMismatchWarning ? C.amber : C.border}`, borderRadius: 10, padding: 12 }}>
+            <div style={{ fontSize: 12, color: C.muted }}>{th ? 'บริษัทในไฟล์' : 'Company in file'}</div>
+            <div style={{ fontWeight: 800, color: companyMismatchWarning ? C.amber : C.text, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{parseSummary.companyNames?.join(' / ') || '-'}</div>
           </div>
           <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 10, padding: 12 }}>
             <div style={{ fontSize: 12, color: C.muted }}>{th ? 'รายงานรายเดือน' : 'Monthly Rows'}</div>

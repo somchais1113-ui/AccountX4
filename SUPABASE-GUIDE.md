@@ -271,3 +271,31 @@ curl -X POST \
 ```
 
 For production, schedule this function with Supabase Cron, Vercel Cron, GitHub Actions, or another secure scheduler.
+
+## v1.7.5 Dashboard Data Finder Migration
+
+After deploying v1.7.5, run the following SQL file in Supabase SQL Editor:
+
+```text
+supabase/migrations/202606220008_dashboard_data_finder_indexes.sql
+```
+
+This migration only adds idempotent indexes for faster Dashboard Data Finder and Historical Snapshot loading. It does not delete or rewrite financial data.
+
+Dashboard behavior in v1.7.5:
+- Default mode: Latest confirmed batch for selected company/year/period.
+- Historical mode: user can select a specific import batch/file and view it on the Dashboard.
+- Superseded/rolled_back/rejected batches are shown as archived snapshots and should be used for audit/backtracking, not current reporting.
+
+## v1.7.6 Private Snapshot Reconcile Migration
+
+After deploying v1.7.6, run:
+
+```text
+supabase/migrations/202606220009_private_snapshot_reconcile.sql
+```
+
+This migration does not delete rows. It only:
+- marks stale monthly rows as `superseded`, keeping the latest confirmed row per company/year/month;
+- marks stale trial-balance rows as `superseded`, keeping the latest confirmed batch per company/year;
+- reconciles `import_batches.status` from `normalized_financial_data`, `monthly_operating_data`, and `trial_balance_data` together.
