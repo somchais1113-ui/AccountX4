@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { parseFinancialFile, CORE_GROUPS } from '../lib/parser';
 import { parsePrivateFile } from '../lib/privateParser';
+import { createAlertEvent } from '../lib/supabase';
 
 const SOURCE_OPTIONS = {
   public: [
@@ -53,6 +54,20 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
 
   const sourceOptions = SOURCE_OPTIONS[companyMode] || SOURCE_OPTIONS.private;
   const activeSource = sourceOptions.find(item => item.id === sourceType) || sourceOptions[0];
+  const queueFailureAlert = async (title, error, extra = {}) => {
+    try {
+      await createAlertEvent({
+        eventType: 'import_failed',
+        severity: 'critical',
+        companyId,
+        title,
+        message: error?.message || String(error || 'Unknown import error'),
+        metadata: { source_type: sourceType, legal_entity_type: legalEntityType, file_name: batchDetails.fileName, ...extra },
+      });
+    } catch (_) {
+      // Alert migration may not be installed yet; do not block the user flow.
+    }
+  };
 
   useEffect(() => {
     const nextLegalEntityType = getDefaultLegalEntityType(company);
@@ -144,6 +159,7 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
       setStatus(null);
     } catch (err) {
       console.error(err);
+      await queueFailureAlert('Import parse failed', err, { stage: 'parse' });
       setStatus({ type: 'error', msg: err.message });
     }
   };
@@ -189,6 +205,7 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
       }, 1800);
     } catch (err) {
       console.error(err);
+      await queueFailureAlert('Import save failed', err, { stage: 'save', fiscal_year: batchDetails.fiscalYear, period_type: batchDetails.periodType });
       setStatus({ type: 'error', msg: formatErrorMessage(err) });
       window.scrollTo({ top: 0, behavior: 'smooth' });
       setSaving(false);

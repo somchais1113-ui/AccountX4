@@ -291,3 +291,23 @@ New UI pages:
 - Mapping Center: review low-confidence mappings and persist corrected account groups.
 
 If Supabase Storage bucket creation is restricted in your environment, imports still work; raw file download will be unavailable until the `raw-financial-files` bucket is created.
+
+## v1.7 Alert Engine + LINE-ready Integration
+
+Adds an actor-aware alert layer for auditability and future LINE Messaging API delivery.
+
+### New features
+- New sidebar page: Alerts / LINE Alert
+- `alert_events` table for line-ready notification queue
+- `line_alert_settings` table for company alert preferences
+- Every alert stores actor info: user id, email, display name
+- Import success / mapping review events
+- Import parse/save failure events
+- Rollback events
+- Account mapping change events
+- Permission change events
+- LINE settings UI with recipient type/id, but Channel Access Token remains server-side only
+
+### Required migration
+Run `supabase/migrations/202606220004_alert_engine.sql` after v1.6 migrations.
+

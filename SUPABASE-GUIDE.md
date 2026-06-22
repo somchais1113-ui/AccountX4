@@ -175,3 +175,31 @@ select id, file_name, status, total_rows, review_count, storage_path, imported_a
 from public.import_batches
 order by imported_at desc;
 ```
+
+## v1.7 Alert Engine Migration
+
+Run this after the v1.6 Data Governance migration:
+
+```sql
+-- supabase/migrations/202606220004_alert_engine.sql
+```
+
+Then verify:
+
+```sql
+select table_name
+from information_schema.tables
+where table_schema = 'public'
+and table_name in ('alert_events', 'line_alert_settings')
+order by table_name;
+```
+
+Expected:
+
+```text
+alert_events
+line_alert_settings
+```
+
+LINE Channel Access Tokens must not be stored in the frontend or public Supabase tables. Store them in server/edge function environment variables when the real LINE push sender is added.
+

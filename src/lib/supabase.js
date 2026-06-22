@@ -264,6 +264,139 @@ async function updateIfSupported(queryFactory, fallbackDeleteFactory = null) {
   throw normalizeSupabaseError(error);
 }
 
+
+async function getCurrentActor(client) {
+  try {
+    const { data } = await client.auth.getUser();
+    const user = data?.user || null;
+    if (!user) return { actor_user_id: null, actor_email: null, actor_name: null };
+    return {
+      actor_user_id: user.id,
+      actor_email: user.email || null,
+      actor_name: user.user_metadata?.full_name || user.user_metadata?.name || user.email || null,
+    };
+  } catch (_) {
+    return { actor_user_id: null, actor_email: null, actor_name: null };
+  }
+}
+
+export async function createAlertEvent(event = {}) {
+  const client = requireClient();
+  const actor = await getCurrentActor(client);
+  const payload = {
+    event_type: event.eventType || event.event_type || 'system_event',
+    severity: event.severity || 'info',
+    status: event.status || 'pending',
+    company_id: event.companyId ?? event.company_id ?? null,
+    import_batch_id: event.importBatchId ?? event.import_batch_id ?? null,
+    actor_user_id: event.actorUserId ?? event.actor_user_id ?? actor.actor_user_id,
+    actor_email: event.actorEmail ?? event.actor_email ?? actor.actor_email,
+    actor_name: event.actorName ?? event.actor_name ?? actor.actor_name,
+    title: event.title || 'FinAnalytics Alert',
+    message: event.message || null,
+    metadata: event.metadata || {},
+    delivery_channel: event.deliveryChannel || event.delivery_channel || 'line',
+    recipient_type: event.recipientType || event.recipient_type || null,
+    recipient_id: event.recipientId || event.recipient_id || null,
+  };
+  const { data, error } = await client.from('alert_events').insert(payload).select('id').single();
+  if (error) {
+    // Alerts should never block the core workflow while the alert migration is being installed.
+    if (/alert_events|schema cache|Could not find|does not exist/i.test(error.message || '')) return null;
+    throw normalizeSupabaseError(error);
+  }
+  return data;
+}
+
+async function createAlertEventSafe(client, event = {}) {
+  try {
+    const actor = await getCurrentActor(client);
+    const { error } = await client.from('alert_events').insert({
+      event_type: event.eventType || event.event_type || 'system_event',
+      severity: event.severity || 'info',
+      status: event.status || 'pending',
+      company_id: event.companyId ?? event.company_id ?? null,
+      import_batch_id: event.importBatchId ?? event.import_batch_id ?? null,
+      actor_user_id: event.actorUserId ?? event.actor_user_id ?? actor.actor_user_id,
+      actor_email: event.actorEmail ?? event.actor_email ?? actor.actor_email,
+      actor_name: event.actorName ?? event.actor_name ?? actor.actor_name,
+      title: event.title || 'FinAnalytics Alert',
+      message: event.message || null,
+      metadata: event.metadata || {},
+      delivery_channel: event.deliveryChannel || event.delivery_channel || 'line',
+      recipient_type: event.recipientType || event.recipient_type || null,
+      recipient_id: event.recipientId || event.recipient_id || null,
+    });
+    if (error && !/alert_events|schema cache|Could not find|does not exist/i.test(error.message || '')) {
+      console.warn('Could not create alert event:', error.message);
+    }
+  } catch (error) {
+    console.warn('Could not create alert event:', error?.message || error);
+  }
+}
+
+export async function loadAlertEvents(companyId = null, limit = 200) {
+  const client = requireClient();
+  let query = client
+    .from('alert_events')
+    .select('*,companies(name_th,name_en,ticker_symbol)')
+    .order('created_at', { ascending: false })
+    .limit(limit);
+  if (companyId) query = query.eq('company_id', companyId);
+  const { data, error } = await query;
+  if (error) {
+    if (/alert_events|schema cache|Could not find|does not exist/i.test(error.message || '')) return [];
+    throw normalizeSupabaseError(error);
+  }
+  return data || [];
+}
+
+export async function updateAlertEventStatus(alertId, status = 'read') {
+  const client = requireClient();
+  const payload = { status, updated_at: new Date().toISOString() };
+  if (status === 'read') payload.read_at = new Date().toISOString();
+  if (status === 'sent') payload.sent_at = new Date().toISOString();
+  const { error } = await client.from('alert_events').update(payload).eq('id', alertId);
+  if (error) throw normalizeSupabaseError(error);
+}
+
+export async function loadLineAlertSettings(companyId) {
+  const client = requireClient();
+  const { data, error } = await client
+    .from('line_alert_settings')
+    .select('*')
+    .eq('company_id', companyId)
+    .maybeSingle();
+  if (error) {
+    if (/line_alert_settings|schema cache|Could not find|does not exist/i.test(error.message || '')) return null;
+    throw normalizeSupabaseError(error);
+  }
+  return data || null;
+}
+
+export async function saveLineAlertSettings(companyId, settings = {}) {
+  const client = requireClient();
+  const actor = await getCurrentActor(client);
+  const payload = {
+    company_id: companyId,
+    is_enabled: Boolean(settings.is_enabled),
+    recipient_type: settings.recipient_type || 'group',
+    recipient_id: settings.recipient_id || null,
+    notify_import_success: settings.notify_import_success ?? true,
+    notify_import_failed: settings.notify_import_failed ?? true,
+    notify_mapping_review: settings.notify_mapping_review ?? true,
+    notify_data_quality_warning: settings.notify_data_quality_warning ?? true,
+    notify_rollback: settings.notify_rollback ?? true,
+    notify_mapping_change: settings.notify_mapping_change ?? true,
+    notify_permission_change: settings.notify_permission_change ?? true,
+    notify_daily_summary: settings.notify_daily_summary ?? false,
+    created_by: actor.actor_user_id,
+    updated_at: new Date().toISOString(),
+  };
+  const { error } = await client.from('line_alert_settings').upsert(payload, { onConflict: 'company_id' });
+  if (error) throw normalizeSupabaseError(error);
+}
+
 async function uploadRawFileForBatch(client, companyId, batchId, batchDetails = {}) {
   const file = batchDetails.rawFile;
   if (!file || typeof client.storage?.from !== 'function') return null;
@@ -399,6 +532,36 @@ export async function saveImportBatch(companyId, batchDetails, normalizedDataRow
   const rowsImported = await insertInChunks(client, "normalized_financial_data", payload);
   await uploadRawFileForBatch(client, companyId, batch.id, batchDetails);
   await upsertAccountMappings(client, companyId, safeRows);
+
+  await createAlertEventSafe(client, {
+    eventType: 'import_success',
+    severity: batchDetails.reviewCount > 0 ? 'warning' : 'success',
+    companyId,
+    importBatchId: batch.id,
+    title: batchDetails.reviewCount > 0 ? 'Import saved with mapping review' : 'Import saved successfully',
+    message: `${batchDetails.fileName || 'Financial statement'} saved with ${rowsImported} rows.`,
+    metadata: {
+      file_name: batchDetails.fileName,
+      fiscal_year: batchDetails.fiscalYear,
+      period_type: batchDetails.periodType || 'annual',
+      period: batchDetails.period || 'FY',
+      source_type: batchDetails.sourceType || 'public_financial_statement',
+      parser_profile: batchDetails.parserProfile || null,
+      review_count: batchDetails.reviewCount ?? 0,
+      rows_imported: rowsImported,
+    },
+  });
+  if (Number(batchDetails.reviewCount || 0) > 0) {
+    await createAlertEventSafe(client, {
+      eventType: 'mapping_review_required',
+      severity: 'warning',
+      companyId,
+      importBatchId: batch.id,
+      title: 'Mapping review required',
+      message: `${batchDetails.reviewCount} rows need accounting mapping review.`,
+      metadata: { file_name: batchDetails.fileName, review_count: batchDetails.reviewCount, rows_imported: rowsImported },
+    });
+  }
   
   return { batchId: batch.id, rowsImported };
 }
@@ -564,6 +727,38 @@ export async function savePrivateImportBatch(companyId, batchDetails, privatePay
 
   await uploadRawFileForBatch(client, companyId, batch.id, batchDetails);
   if (normalizedRows.length) await upsertAccountMappings(client, companyId, normalizedRows);
+
+  await createAlertEventSafe(client, {
+    eventType: 'import_success',
+    severity: (privatePayload.summary?.reviewCount || 0) > 0 ? 'warning' : 'success',
+    companyId,
+    importBatchId: batch.id,
+    title: (privatePayload.summary?.reviewCount || 0) > 0 ? 'Private import saved with review' : 'Private import saved successfully',
+    message: `${batchDetails.fileName || 'Private company file'} saved with ${rowsImported} rows.`,
+    metadata: {
+      file_name: batchDetails.fileName,
+      fiscal_year: batchDetails.fiscalYear,
+      period_type: batchDetails.periodType || (monthlyRows.length ? 'monthly' : 'annual'),
+      source_type: batchDetails.sourceType || 'private_company_file',
+      parser_profile: batchDetails.parserProfile || 'PRIVATE_COMPANY_IMPORT_PACK_V1',
+      review_count: privatePayload.summary?.reviewCount ?? 0,
+      rows_imported: rowsImported,
+      monthly_rows: monthlyRows.length,
+      trial_balance_rows: trialBalanceRows.length,
+      normalized_rows: normalizedRows.length,
+    },
+  });
+  if (Number(privatePayload.summary?.reviewCount || 0) > 0) {
+    await createAlertEventSafe(client, {
+      eventType: 'mapping_review_required',
+      severity: 'warning',
+      companyId,
+      importBatchId: batch.id,
+      title: 'Private company mapping review required',
+      message: `${privatePayload.summary.reviewCount} rows need mapping review.`,
+      metadata: { file_name: batchDetails.fileName, review_count: privatePayload.summary.reviewCount },
+    });
+  }
   return { batchId: batch.id, rowsImported };
 }
 
@@ -637,6 +832,15 @@ export async function rollbackImportBatch(batchId) {
     ]);
     await client.from('import_batches').update({ status: 'confirmed' }).eq('id', previousId);
   }
+  await createAlertEventSafe(client, {
+    eventType: 'import_rollback',
+    severity: 'critical',
+    companyId: batch.company_id,
+    importBatchId: batchId,
+    title: 'Import rolled back',
+    message: previousId ? 'Import was rolled back and previous batch was restored.' : 'Import was rolled back. No previous batch was restored.',
+    metadata: { batch_id: batchId, restored_batch_id: previousId || null, fiscal_year: batch.fiscal_year, period: batch.period },
+  });
   return { restoredBatchId: previousId || null };
 }
 
@@ -671,6 +875,14 @@ export async function updateMappingForRawAccount({ companyId, rawAccountName, st
     .eq('raw_account_name', rawAccountName)
     .eq('statement_type', statementType);
   if (rowError) throw normalizeSupabaseError(rowError);
+  await createAlertEventSafe(client, {
+    eventType: 'mapping_changed',
+    severity: 'warning',
+    companyId,
+    title: 'Account mapping changed',
+    message: `${rawAccountName} mapped to ${accountGroup}.`,
+    metadata: { raw_account_name: rawAccountName, statement_type: statementType, account_group: accountGroup, account_subgroup: accountSubgroup },
+  });
 }
 
 export async function getRawFileSignedUrl(storagePath, expiresIn = 300) {
@@ -724,18 +936,36 @@ export async function loadCompanyMembers(companyId) {
 }
 
 export async function grantCompanyAccess(companyId, email, role) {
-  const { error } = await requireClient().rpc("grant_company_access", {
+  const client = requireClient();
+  const { error } = await client.rpc("grant_company_access", {
     target_company_id: companyId,
     target_email: email,
     target_role: role,
   });
   if (error) throw error;
+  await createAlertEventSafe(client, {
+    eventType: 'permission_changed',
+    severity: 'security',
+    companyId,
+    title: 'User access granted',
+    message: `${email} was granted ${role} access.`,
+    metadata: { target_email: email, target_role: role, action: 'grant' },
+  });
 }
 
 export async function revokeCompanyAccess(companyId, userId) {
-  const { error } = await requireClient().rpc("revoke_company_access", {
+  const client = requireClient();
+  const { error } = await client.rpc("revoke_company_access", {
     target_company_id: companyId,
     target_user_id: userId,
   });
   if (error) throw error;
+  await createAlertEventSafe(client, {
+    eventType: 'permission_changed',
+    severity: 'security',
+    companyId,
+    title: 'User access revoked',
+    message: `Access was revoked for user ${userId}.`,
+    metadata: { target_user_id: userId, action: 'revoke' },
+  });
 }

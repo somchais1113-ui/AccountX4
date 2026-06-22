@@ -13,6 +13,7 @@ import {
   loadAuditLog, loadCompanyMembers, grantCompanyAccess, revokeCompanyAccess,
   loadImportHistory, loadImportBatchRows, rollbackImportBatch, getRawFileSignedUrl,
   loadMappingReviewRows, updateMappingForRawAccount,
+  loadAlertEvents, updateAlertEventStatus, loadLineAlertSettings, saveLineAlertSettings, createAlertEvent,
 } from "./lib/supabase.js";
 import ImportWizard from "./components/ImportWizard";
 import MomentumDashboard from "./components/Dashboard";
@@ -1760,6 +1761,169 @@ function MappingCenterPage({ companyId, lang, onRefresh }) {
   );
 }
 
+function AlertCenterPage({ companyId, companies, lang }) {
+  const C = useC();
+  const th = lang === "th";
+  const company = companies.find(c => c.id === companyId);
+  const [rows, setRows] = useState([]);
+  const [settings, setSettings] = useState(null);
+  const [status, setStatus] = useState({ loading: true, error: "", message: "" });
+  const [saving, setSaving] = useState(false);
+  const severityColor = (severity) => ({
+    success: C.green,
+    info: C.accent,
+    warning: C.amber,
+    critical: C.red,
+    security: C.purple,
+    summary: C.blue,
+  }[severity] || C.muted);
+
+  const refresh = async () => {
+    if (!isSupabaseConfigured) {
+      setStatus({ loading: false, error: th ? "ต้องเชื่อม Supabase ก่อน" : "Supabase is required", message: "" });
+      return;
+    }
+    setStatus({ loading: true, error: "", message: "" });
+    try {
+      const [events, cfg] = await Promise.all([
+        loadAlertEvents(companyId, 200),
+        loadLineAlertSettings(companyId),
+      ]);
+      setRows(events);
+      setSettings(cfg || {
+        is_enabled: false,
+        recipient_type: "group",
+        recipient_id: "",
+        notify_import_success: true,
+        notify_import_failed: true,
+        notify_mapping_review: true,
+        notify_data_quality_warning: true,
+        notify_rollback: true,
+        notify_mapping_change: true,
+        notify_permission_change: true,
+        notify_daily_summary: false,
+      });
+      setStatus({ loading: false, error: "", message: "" });
+    } catch (error) {
+      setStatus({ loading: false, error: error.message, message: "" });
+    }
+  };
+  useEffect(() => { refresh(); }, [companyId, lang]);
+
+  const saveSettings = async () => {
+    setSaving(true);
+    setStatus(prev => ({ ...prev, message: "" }));
+    try {
+      await saveLineAlertSettings(companyId, settings);
+      setStatus({ loading: false, error: "", message: th ? "บันทึกการตั้งค่าแจ้งเตือนแล้ว" : "Alert settings saved" });
+      await refresh();
+    } catch (error) {
+      setStatus({ loading: false, error: error.message, message: "" });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const sendTest = async () => {
+    try {
+      await createAlertEvent({
+        eventType: "line_test",
+        severity: "info",
+        companyId,
+        title: "LINE test alert queued",
+        message: th ? "สร้างข้อความทดสอบสำหรับ LINE แล้ว" : "A test LINE alert has been queued.",
+        metadata: { company: company?.tickerSymbol || company?.nameTh, created_from: "alert_center" },
+      });
+      await refresh();
+    } catch (error) {
+      setStatus({ loading: false, error: error.message, message: "" });
+    }
+  };
+
+  const markRead = async (id) => {
+    try { await updateAlertEventStatus(id, "read"); await refresh(); }
+    catch (error) { setStatus({ loading: false, error: error.message, message: "" }); }
+  };
+
+  const pending = rows.filter(row => row.status === "pending").length;
+  const warnings = rows.filter(row => ["warning", "critical", "security"].includes(row.severity)).length;
+  const actorText = (row) => row.actor_name || row.actor_email || row.actor_user_id || "system";
+
+  return (
+    <div>
+      <PageHeader
+        title={th ? "แจ้งเตือน / LINE Alert" : "Alerts / LINE Alert"}
+        subtitle={th ? "ติดตามว่าใครทำอะไรกับข้อมูล และเตรียมส่งต่อเข้า LINE Official Account" : "Track who did what and queue LINE-ready notifications"}
+      />
+      <div className="responsive-grid-3" style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:12, marginBottom:16 }}>
+        <Card><div style={{fontSize:12,color:C.muted,fontWeight:800}}>Pending</div><div style={{fontSize:30,fontWeight:900,color:pending?C.amber:C.green}}>{pending}</div></Card>
+        <Card><div style={{fontSize:12,color:C.muted,fontWeight:800}}>{th?"เหตุการณ์ที่ต้องสนใจ":"Warnings"}</div><div style={{fontSize:30,fontWeight:900,color:warnings?C.red:C.green}}>{warnings}</div></Card>
+        <Card><div style={{fontSize:12,color:C.muted,fontWeight:800}}>{th?"บริษัท":"Company"}</div><div style={{fontSize:17,fontWeight:900}}>{company?.tickerSymbol || company?.nameTh || "-"}</div></Card>
+      </div>
+
+      <Card style={{ marginBottom:16 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", gap:12, flexWrap:"wrap", alignItems:"flex-start" }}>
+          <div>
+            <div style={{fontSize:18,fontWeight:900,marginBottom:6}}>{th?"ตั้งค่า LINE Alert":"LINE Alert Settings"}</div>
+            <div style={{fontSize:13,color:C.muted,lineHeight:1.6}}>
+              {th
+                ? "ระบบจะเก็บ event ไว้ใน alert_events พร้อมชื่อผู้ดำเนินการเสมอ ส่วน Channel Access Token ควรเก็บใน Server/Edge Function ไม่ควรเก็บใน frontend หรือ public table"
+                : "Events are stored in alert_events with actor identity. Keep the Channel Access Token in a server/edge function, not in frontend or public tables."}
+            </div>
+          </div>
+          <Badge color={settings?.is_enabled ? C.green : C.muted}>{settings?.is_enabled ? "Enabled" : "Queue only"}</Badge>
+        </div>
+        {settings && <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))", gap:12, marginTop:16 }}>
+          <label style={{fontSize:12,color:C.muted,fontWeight:800}}>{th?"สถานะ":"Status"}<select value={settings.is_enabled ? "on" : "off"} onChange={e=>setSettings({...settings,is_enabled:e.target.value==='on'})} style={{width:"100%",marginTop:6,padding:10,borderRadius:8,border:`1px solid ${C.border}`,background:C.surface,color:C.text}}><option value="off">Queue only</option><option value="on">LINE enabled</option></select></label>
+          <label style={{fontSize:12,color:C.muted,fontWeight:800}}>{th?"ประเภทผู้รับ":"Recipient type"}<select value={settings.recipient_type || "group"} onChange={e=>setSettings({...settings,recipient_type:e.target.value})} style={{width:"100%",marginTop:6,padding:10,borderRadius:8,border:`1px solid ${C.border}`,background:C.surface,color:C.text}}><option value="group">LINE Group</option><option value="user">LINE User</option><option value="room">LINE Room</option></select></label>
+          <label style={{fontSize:12,color:C.muted,fontWeight:800}}>Recipient ID<input value={settings.recipient_id || ""} onChange={e=>setSettings({...settings,recipient_id:e.target.value})} placeholder="groupId / userId" style={{width:"100%",marginTop:6,padding:10,borderRadius:8,border:`1px solid ${C.border}`,background:C.surface,color:C.text}}/></label>
+        </div>}
+        {settings && <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(230px,1fr))",gap:9,marginTop:16}}>
+          {[
+            ["notify_import_success", th?"Import สำเร็จ":"Import success"],
+            ["notify_import_failed", th?"Import ไม่สำเร็จ":"Import failed"],
+            ["notify_mapping_review", th?"Mapping ต้องตรวจ":"Mapping review"],
+            ["notify_data_quality_warning", th?"คุณภาพข้อมูลเตือน":"Data quality warning"],
+            ["notify_rollback", th?"Rollback / Superseded":"Rollback / Superseded"],
+            ["notify_mapping_change", th?"แก้ Mapping":"Mapping changed"],
+            ["notify_permission_change", th?"เปลี่ยนสิทธิ์":"Permission changed"],
+            ["notify_daily_summary", th?"สรุปรายวัน":"Daily summary"],
+          ].map(([key,label]) => <label key={key} style={{display:"flex",gap:8,alignItems:"center",fontSize:13,color:C.text}}><input type="checkbox" checked={Boolean(settings[key])} onChange={e=>setSettings({...settings,[key]:e.target.checked})}/><span>{label}</span></label>)}
+        </div>}
+        <div style={{display:"flex",gap:10,flexWrap:"wrap",marginTop:16}}>
+          <button onClick={saveSettings} disabled={saving || !settings} style={{border:"none",background:C.accent,color:"#fff",padding:"10px 14px",borderRadius:8,fontWeight:800,cursor:"pointer"}}>{saving ? (th?"กำลังบันทึก...":"Saving...") : (th?"บันทึกการตั้งค่า":"Save settings")}</button>
+          <button onClick={sendTest} style={{border:`1px solid ${C.border}`,background:C.surface,color:C.text,padding:"10px 14px",borderRadius:8,fontWeight:800,cursor:"pointer"}}>{th?"สร้างข้อความทดสอบ":"Queue test alert"}</button>
+          <button onClick={refresh} style={{border:`1px solid ${C.border}`,background:C.surface,color:C.text,padding:"10px 14px",borderRadius:8,fontWeight:800,cursor:"pointer"}}>{th?"รีเฟรช":"Refresh"}</button>
+        </div>
+        {status.message && <div style={{marginTop:12,color:C.green,fontWeight:800}}>{status.message}</div>}
+      </Card>
+
+      <Card style={{padding:0,overflow:"hidden"}}>
+        <div style={{padding:16,borderBottom:`1px solid ${C.border}`,display:"flex",justifyContent:"space-between",alignItems:"center",gap:12}}>
+          <div style={{fontWeight:900}}>{th?"เหตุการณ์ล่าสุด":"Recent alert events"}</div>
+          <div style={{fontSize:12,color:C.muted}}>{th?"ทุกแถวมีผู้ดำเนินการ / actor":"Every event includes an actor"}</div>
+        </div>
+        {status.loading ? <div style={{padding:20,color:C.muted}}>{th?"กำลังโหลด...":"Loading..."}</div>
+          : status.error ? <div style={{padding:20,color:C.red}}>{status.error}</div>
+          : rows.length === 0 ? <div style={{padding:24,textAlign:"center",color:C.muted}}>{th?"ยังไม่มีเหตุการณ์แจ้งเตือน":"No alert events yet"}</div>
+          : <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:1080}}>
+            <thead><tr>{[th?"เวลา":"Time",th?"ระดับ":"Severity",th?"เหตุการณ์":"Event",th?"ผู้ดำเนินการ":"Actor",th?"บริษัท":"Company",th?"ข้อความ":"Message",th?"สถานะ":"Status",""] .map(h=><th key={h} style={{textAlign:"left",padding:11,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
+            <tbody>{rows.map(row => <tr key={row.id} style={{borderBottom:`1px solid ${C.border}`}}>
+              <td style={{padding:11,color:C.muted,whiteSpace:"nowrap"}}>{new Date(row.created_at).toLocaleString(th?"th-TH":"en-US")}</td>
+              <td style={{padding:11}}><Badge color={severityColor(row.severity)}>{row.severity}</Badge></td>
+              <td style={{padding:11,fontWeight:850}}>{row.title}<div style={{fontSize:11,color:C.muted}}>{row.event_type}</div></td>
+              <td style={{padding:11}}>{actorText(row)}<div style={{fontSize:11,color:C.muted}}>{row.actor_email || ""}</div></td>
+              <td style={{padding:11}}>{row.companies?.ticker_symbol || row.company_id || "-"}</td>
+              <td style={{padding:11,maxWidth:360,lineHeight:1.45}}>{row.message || "-"}</td>
+              <td style={{padding:11}}><Badge color={row.status === "pending" ? C.amber : row.status === "read" ? C.green : C.muted}>{row.status}</Badge></td>
+              <td style={{padding:11,textAlign:"right"}}>{row.status !== "read" && <button onClick={()=>markRead(row.id)} style={{border:"none",background:C.greenLo,color:C.green,borderRadius:8,padding:"7px 10px",fontWeight:800,cursor:"pointer"}}>{th?"อ่านแล้ว":"Read"}</button>}</td>
+            </tr>)}</tbody>
+          </table></div>}
+      </Card>
+    </div>
+  );
+}
+
 function BackupPage({companies,store,exchangeRates,onImport,lang}) {
   const C = useC();
   const th = lang==="th";
@@ -1801,6 +1965,7 @@ const NAV = [
   {id:"imports", icon:"🧭", th:"ประวัตินำเข้า", en:"Import History"},
   {id:"quality", icon:"✅", th:"คุณภาพข้อมูล", en:"Data Quality"},
   {id:"mapping", icon:"🧩", th:"Mapping", en:"Mapping"},
+  {id:"alerts", icon:"🔔", th:"แจ้งเตือน", en:"Alerts"},
   {id:"audit", icon:"🧾", th:"Audit Log", en:"Audit Log"},
   {id:"backup", icon:"💾", th:"สำรองข้อมูล", en:"Backup"},
 ];
@@ -2012,6 +2177,7 @@ export default function App() {
     if (page==="imports") return <ImportHistoryPage companyId={companyId} companies={companies} onRefresh={refreshRemoteData} lang={lang}/>;
     if (page==="quality") return <DataQualityPage store={store} companyId={companyId} lang={lang}/>;
     if (page==="mapping") return <MappingCenterPage companyId={companyId} lang={lang} onRefresh={refreshRemoteData}/>;
+    if (page==="alerts") return <AlertCenterPage companyId={companyId} companies={companies} lang={lang}/>;
     if (page==="audit") return <AuditPage lang={lang}/>;
     if (page==="backup") return <BackupPage companies={companies} store={store} exchangeRates={exchangeRates} onImport={handleBackupImport} lang={lang}/>;
   };
