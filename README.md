@@ -182,3 +182,73 @@ Key changes:
 - เพิ่ม Detailed Financial Statement browser แยกงบกำไรขาดทุน / งบฐานะการเงิน / กระแสเงินสด
 - ปรับสีกราฟไม่ให้มีแท่งสีดำเป็นตัวนำ โดยใช้ Asset = Blue, Liability = Red, Equity/Profit/Cash Flow = Green/Accent ตาม theme
 - ยังอ่านข้อมูลจาก normalized_financial_data ผ่าน store เดิม ไม่ต้องรัน migration ใหม่
+
+## v1.5 Private Company Import Pack
+
+This version adds a separate import path for non-listed/private companies while keeping the public-company SET parser intact.
+
+### New modes
+
+Company records can now be classified by `company_mode`:
+
+- `public` — listed/public companies using SET-style annual/quarterly financial statements.
+- `private` — normal juristic persons/private companies using internal accounting files.
+
+### New private-company upload types
+
+The upload page now changes behavior based on company mode.
+
+For private companies, the importer supports:
+
+1. **Private financial statement** — annual financial statements from an accountant.
+2. **Monthly management report** — monthly revenue, expense, cash-in, cash-out, and loan balance.
+3. **Trial balance** — account code/name, debit, credit, ending balance.
+
+### New Supabase migration
+
+Run this migration after the previous normalized schema migration:
+
+```sql
+supabase/migrations/202606220001_private_company_pack.sql
+```
+
+It adds:
+
+- `companies.company_mode`
+- `import_batches.source_type`
+- `import_batches.parser_profile`
+- `monthly_operating_data`
+- `trial_balance_data`
+
+The migration is designed to be safe to re-run.
+
+### Suggested private monthly file headers
+
+```csv
+month,year,revenue,expense,cash_in,cash_out,loan_balance
+1,2025,1200000,800000,950000,700000,5000000
+2,2025,1350000,850000,1200000,760000,4900000
+```
+
+Thai headers are also supported, for example:
+
+```csv
+เดือน,ปี,รายได้,ค่าใช้จ่าย,เงินสดเข้า,เงินสดออก,เงินกู้
+1,2568,1200000,800000,950000,700000,5000000
+```
+
+### Suggested trial balance headers
+
+```csv
+account_code,account_name,debit,credit,ending_balance
+4000,Sales revenue,0,12000000,12000000
+5000,Cost of sales,7500000,0,7500000
+```
+
+Thai headers are also supported, for example:
+
+```csv
+รหัสบัญชี,ชื่อบัญชี,เดบิต,เครดิต,ยอดคงเหลือ
+4000,รายได้จากการขาย,0,12000000,12000000
+5000,ต้นทุนขาย,7500000,0,7500000
+```

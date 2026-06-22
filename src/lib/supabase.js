@@ -59,11 +59,24 @@ export async function loadCompanies() {
   const client = requireClient();
   const { data: userData, error: userError } = await client.auth.getUser();
   if (userError) throw userError;
-  const { data, error } = await client
+
+  let query = client
     .from("companies")
-    .select("id,name_th,name_en,currency,type,industry,group_id,ticker_symbol,fiscal_year_end")
+    .select("id,name_th,name_en,currency,type,industry,group_id,ticker_symbol,fiscal_year_end,company_mode")
     .order("id");
+  let { data, error } = await query;
+
+  // Backward compatible fallback for databases that have not run the v1.5 private-company migration yet.
+  if (error && /company_mode|schema cache|Could not find/i.test(error.message || '')) {
+    const fallback = await client
+      .from("companies")
+      .select("id,name_th,name_en,currency,type,industry,group_id,ticker_symbol,fiscal_year_end")
+      .order("id");
+    data = fallback.data;
+    error = fallback.error;
+  }
   if (error) throw error;
+
   const { data: memberships, error: membershipError } = await client
     .from("company_members")
     .select("company_id,role")
@@ -80,12 +93,14 @@ export async function loadCompanies() {
     groupId: company.group_id,
     tickerSymbol: company.ticker_symbol,
     fiscalYearEnd: company.fiscal_year_end,
+    companyMode: company.company_mode || (company.ticker_symbol ? 'public' : 'private'),
     role: roles.get(company.id) || "viewer",
   }));
 }
 
 export async function createCompany(company) {
-  const { data, error } = await requireClient().from("companies").insert({
+  const client = requireClient();
+  const payload = {
     name_th: company.nameTh,
     name_en: company.nameEn,
     currency: company.currency,
@@ -93,14 +108,23 @@ export async function createCompany(company) {
     industry: company.industry,
     group_id: company.groupId || null,
     ticker_symbol: company.tickerSymbol || null,
-    fiscal_year_end: company.fiscalYearEnd || '12-31'
-  }).select("id").single();
+    fiscal_year_end: company.fiscalYearEnd || '12-31',
+    company_mode: company.companyMode || (company.tickerSymbol ? 'public' : 'private')
+  };
+  let { data, error } = await client.from("companies").insert(payload).select("id").single();
+  if (error && /company_mode|schema cache|Could not find/i.test(error.message || '')) {
+    const { company_mode, ...fallbackPayload } = payload;
+    const fallback = await client.from("companies").insert(fallbackPayload).select("id").single();
+    data = fallback.data;
+    error = fallback.error;
+  }
   if (error) throw error;
   return data;
 }
 
 export async function updateCompany(id, company) {
-  const { error } = await requireClient().from("companies").update({
+  const client = requireClient();
+  const payload = {
     name_th: company.nameTh,
     name_en: company.nameEn,
     currency: company.currency,
@@ -108,8 +132,15 @@ export async function updateCompany(id, company) {
     industry: company.industry,
     group_id: company.groupId || null,
     ticker_symbol: company.tickerSymbol || null,
-    fiscal_year_end: company.fiscalYearEnd || '12-31'
-  }).eq("id", id);
+    fiscal_year_end: company.fiscalYearEnd || '12-31',
+    company_mode: company.companyMode || (company.tickerSymbol ? 'public' : 'private')
+  };
+  let { error } = await client.from("companies").update(payload).eq("id", id);
+  if (error && /company_mode|schema cache|Could not find/i.test(error.message || '')) {
+    const { company_mode, ...fallbackPayload } = payload;
+    const fallback = await client.from("companies").update(fallbackPayload).eq("id", id);
+    error = fallback.error;
+  }
   if (error) throw error;
 }
 
@@ -136,6 +167,58 @@ export async function loadAllNormalizedData() {
     pd.groups[record.account_group] = (pd.groups[record.account_group] || 0) + Number(record.amount);
   });
   return store;
+}
+
+
+export async function loadAllMonthlyOperatingData() {
+  const client = requireClient();
+  const { data, error } = await client
+    .from("monthly_operating_data")
+    .select("*")
+    .order("fiscal_year")
+    .order("month");
+  if (error) {
+    if (/monthly_operating_data|schema cache|Could not find|does not exist/i.test(error.message || '')) return {};
+    throw error;
+  }
+  const store = {};
+  (data || []).forEach((record) => {
+    store[record.company_id] ||= {};
+    store[record.company_id][record.fiscal_year] ||= {};
+    const idx = Number(record.month) - 1;
+    store[record.company_id][record.fiscal_year][idx] = {
+      monthIdx: idx,
+      revenue: Number(record.revenue) || 0,
+      expense: Number(record.expense) || 0,
+      cashIn: Number(record.cash_in) || 0,
+      cashOut: Number(record.cash_out) || 0,
+      loanBalance: Number(record.loan_balance) || 0,
+      _sourceType: 'private_monthly_report',
+      _updatedAt: record.updated_at,
+    };
+  });
+  return store;
+}
+
+function mergeStores(...stores) {
+  const merged = {};
+  for (const store of stores) {
+    for (const [companyId, years] of Object.entries(store || {})) {
+      merged[companyId] ||= {};
+      for (const [year, periods] of Object.entries(years || {})) {
+        merged[companyId][year] = { ...(merged[companyId][year] || {}), ...(periods || {}) };
+      }
+    }
+  }
+  return merged;
+}
+
+export async function loadAllFinancialData() {
+  const [normalizedStore, monthlyStore] = await Promise.all([
+    loadAllNormalizedData(),
+    loadAllMonthlyOperatingData(),
+  ]);
+  return mergeStores(normalizedStore, monthlyStore);
 }
 
 function normalizeSupabaseError(error) {
@@ -167,16 +250,24 @@ export async function saveImportBatch(companyId, batchDetails, normalizedDataRow
   if (!safeRows.length) return { batchId: null, rowsImported: 0 };
   
   // 1. Create batch
-  const { data: batch, error: batchError } = await client.from("import_batches").insert({
+  const batchPayload = {
     company_id: companyId,
     file_name: batchDetails.fileName,
     fiscal_year: batchDetails.fiscalYear,
     period_type: batchDetails.periodType || 'annual',
     period: batchDetails.period || 'FY',
     statement_scope: batchDetails.statementScope || 'consolidated',
+    source_type: batchDetails.sourceType || 'public_financial_statement',
+    parser_profile: batchDetails.parserProfile || null,
     status: 'confirmed'
-  }).select("id").single();
-  
+  };
+  let { data: batch, error: batchError } = await client.from("import_batches").insert(batchPayload).select("id").single();
+  if (batchError && /source_type|parser_profile|schema cache|Could not find/i.test(batchError.message || '')) {
+    const { source_type, parser_profile, ...fallbackBatchPayload } = batchPayload;
+    const fallback = await client.from("import_batches").insert(fallbackBatchPayload).select("id").single();
+    batch = fallback.data;
+    batchError = fallback.error;
+  }
   if (batchError) throw normalizeSupabaseError(batchError);
   
   // 2. Insert normalized data
@@ -226,6 +317,142 @@ export async function saveImportBatch(companyId, batchDetails, normalizedDataRow
 
   const rowsImported = await insertInChunks(client, "normalized_financial_data", payload);
   
+  return { batchId: batch.id, rowsImported };
+}
+
+
+export async function savePrivateImportBatch(companyId, batchDetails, privatePayload = {}) {
+  const client = requireClient();
+  const monthlyRows = Array.isArray(privatePayload.monthlyRows) ? privatePayload.monthlyRows : [];
+  const trialBalanceRows = Array.isArray(privatePayload.trialBalanceRows) ? privatePayload.trialBalanceRows : [];
+  const normalizedRows = Array.isArray(privatePayload.normalizedRows) ? privatePayload.normalizedRows : [];
+  const totalInputRows = monthlyRows.length + trialBalanceRows.length + normalizedRows.length;
+  if (!totalInputRows) return { batchId: null, rowsImported: 0 };
+
+  const batchPayload = {
+    company_id: companyId,
+    file_name: batchDetails.fileName,
+    fiscal_year: batchDetails.fiscalYear,
+    period_type: batchDetails.periodType || (monthlyRows.length ? 'monthly' : 'annual'),
+    period: batchDetails.period || (monthlyRows.length ? 'MIXED' : 'FY'),
+    statement_scope: batchDetails.statementScope || 'private_company',
+    source_type: batchDetails.sourceType || 'private_company_file',
+    parser_profile: batchDetails.parserProfile || 'PRIVATE_COMPANY_IMPORT_PACK_V1',
+    status: 'confirmed'
+  };
+  let { data: batch, error: batchError } = await client.from("import_batches").insert(batchPayload).select("id").single();
+  if (batchError && /source_type|parser_profile|schema cache|Could not find/i.test(batchError.message || '')) {
+    const { source_type, parser_profile, ...fallbackBatchPayload } = batchPayload;
+    const fallback = await client.from("import_batches").insert(fallbackBatchPayload).select("id").single();
+    batch = fallback.data;
+    batchError = fallback.error;
+  }
+  if (batchError) throw normalizeSupabaseError(batchError);
+
+  let rowsImported = 0;
+
+  if (monthlyRows.length) {
+    const deleteKeys = new Set(monthlyRows.map(row => [row.fiscal_year, row.month].join('|')));
+    for (const key of deleteKeys) {
+      const [fiscalYear, month] = key.split('|');
+      const { error: deleteError } = await client.from("monthly_operating_data")
+        .delete()
+        .eq("company_id", companyId)
+        .eq("fiscal_year", Number(fiscalYear))
+        .eq("month", Number(month));
+      if (deleteError) throw normalizeSupabaseError(deleteError);
+    }
+    const payload = monthlyRows.map(row => ({
+      company_id: companyId,
+      fiscal_year: row.fiscal_year,
+      month: row.month,
+      revenue: row.revenue || 0,
+      expense: row.expense || 0,
+      cash_in: row.cash_in || 0,
+      cash_out: row.cash_out || 0,
+      loan_balance: row.loan_balance || 0,
+      source_file: row.source_file || batchDetails.fileName,
+      source_sheet: row.source_sheet,
+      source_row: row.source_row,
+      import_batch_id: batch.id,
+      import_status: 'confirmed'
+    }));
+    rowsImported += await insertInChunks(client, "monthly_operating_data", payload);
+  }
+
+  if (trialBalanceRows.length) {
+    const deleteYears = new Set(trialBalanceRows.map(row => row.fiscal_year));
+    for (const fiscalYear of deleteYears) {
+      const { error: deleteError } = await client.from("trial_balance_data")
+        .delete()
+        .eq("company_id", companyId)
+        .eq("fiscal_year", Number(fiscalYear));
+      if (deleteError) throw normalizeSupabaseError(deleteError);
+    }
+    const payload = trialBalanceRows.map(row => ({
+      company_id: companyId,
+      fiscal_year: row.fiscal_year,
+      period_type: row.period_type || 'annual',
+      period: row.period || 'FY',
+      account_code: row.account_code || null,
+      account_name: row.account_name,
+      debit: row.debit || 0,
+      credit: row.credit || 0,
+      ending_balance: row.ending_balance || 0,
+      account_group: row.account_group || 'other',
+      source_file: row.source_file || batchDetails.fileName,
+      source_sheet: row.source_sheet,
+      source_row: row.source_row,
+      import_batch_id: batch.id,
+      import_status: 'confirmed'
+    }));
+    rowsImported += await insertInChunks(client, "trial_balance_data", payload);
+  }
+
+  if (normalizedRows.length) {
+    const payload = normalizedRows.map(row => ({
+      company_id: companyId,
+      fiscal_year: row.fiscal_year,
+      period_type: row.period_type || 'annual',
+      period: row.period || 'FY',
+      statement_scope: row.statement_scope || 'private_company',
+      statement_type: row.statement_type,
+      account_name: row.account_name,
+      account_group: row.account_group,
+      account_subgroup: row.account_subgroup,
+      industry_metric: row.industry_metric,
+      note: row.note,
+      original_amount: row.original_amount,
+      original_unit: row.original_unit,
+      amount: row.amount,
+      normalized_unit: row.normalized_unit || 'baht',
+      raw_account_name: row.raw_account_name,
+      raw_amount: row.raw_amount,
+      raw_unit: row.raw_unit,
+      source_file: row.source_file || batchDetails.fileName,
+      source_sheet: row.source_sheet,
+      source_row: row.source_row,
+      source_column: row.source_column,
+      source_cell: row.source_cell,
+      import_batch_id: batch.id,
+      mapping_confidence: row.mapping_confidence,
+      needs_review: row.needs_review,
+      import_status: 'confirmed'
+    }));
+    const replaceKeys = new Set(payload.map((row) => [row.fiscal_year, row.period || 'FY', row.statement_scope || 'private_company'].join('|')));
+    for (const key of replaceKeys) {
+      const [fiscalYear, period, statementScope] = key.split('|');
+      const { error: deleteError } = await client.from("normalized_financial_data")
+        .delete()
+        .eq("company_id", companyId)
+        .eq("fiscal_year", Number(fiscalYear))
+        .eq("period", period)
+        .eq("statement_scope", statementScope);
+      if (deleteError) throw normalizeSupabaseError(deleteError);
+    }
+    rowsImported += await insertInChunks(client, "normalized_financial_data", payload);
+  }
+
   return { batchId: batch.id, rowsImported };
 }
 
