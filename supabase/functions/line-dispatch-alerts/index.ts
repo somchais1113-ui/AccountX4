@@ -4,8 +4,8 @@
 // - LINE_CHANNEL_ACCESS_TOKEN
 // - SUPABASE_URL
 // - SUPABASE_SERVICE_ROLE_KEY
-// Optional:
-// - ALERT_DISPATCH_SECRET  (recommended for manual/cron calls)
+// Required when deployed with --no-verify-jwt:
+// - ALERT_DISPATCH_SECRET
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
@@ -25,7 +25,8 @@ function getEnv(name: string): string {
 
 function isAuthorized(req: Request): boolean {
   const secret = Deno.env.get('ALERT_DISPATCH_SECRET');
-  if (!secret) return true;
+  // Fail closed because this function is deployed with --no-verify-jwt.
+  if (!secret) return false;
   const headerSecret = req.headers.get('x-dispatch-secret');
   const bearer = req.headers.get('authorization')?.replace(/^Bearer\s+/i, '');
   return headerSecret === secret || bearer === secret;

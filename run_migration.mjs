@@ -15,7 +15,7 @@ import { dirname, join } from "path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const PROJECT_REF = "detvrchwmedexphzxymd";
+const PROJECT_REF = "detvrchwmedexphxzxymd";
 const ACCESS_TOKEN = process.env.SUPABASE_ACCESS_TOKEN || process.argv[2];
 
 if (!ACCESS_TOKEN) {

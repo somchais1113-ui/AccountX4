@@ -1,0 +1,10 @@
+# FinAnalytics / AccountX4 Supabase CLI config
+# Project ref is linked locally by: supabase link --project-ref detvrchwmedexphxzxymd
+
+project_id = "finanalytics-accountx4"
+
+[functions.line-webhook]
+verify_jwt = false
+
+[functions.line-dispatch-alerts]
+verify_jwt = false
