@@ -1,5 +1,6 @@
 import * as XLSX from 'xlsx';
 import { parseFinancialWorkbook } from './parser.js';
+import { applyTfrsStandardMetadata, evaluateTfrsDataQuality } from './accountingStandards.js';
 
 const MONTH_ALIASES = new Map([
   ['มค', 1], ['ม.ค', 1], ['มกราคม', 1], ['jan', 1], ['january', 1], ['1', 1], ['01', 1],
@@ -247,6 +248,19 @@ function trialBalanceToNormalized(tbRows, fileName) {
       const amount = ['revenue', 'liability', 'equity'].includes(group)
         ? Math.abs(row.credit || row.ending_balance)
         : Math.abs(row.debit || row.ending_balance);
+      const mapping = applyTfrsStandardMetadata({
+        label: row.account_name,
+        statementType: statementTypeForMetric(group),
+        section: 'private_trial_balance',
+        mapping: {
+          group,
+          subgroup: null,
+          confidence: group === 'other' ? 0.3 : 0.85,
+          mapping_source: group === 'other' ? 'unknown' : 'parser_rule',
+          review_reason: group === 'other' ? 'Unknown private-company account mapping.' : null,
+        },
+        row: { legal_entity_type: 'limited_company', company_mode: 'private', source_type: 'trial_balance' },
+      });
       return {
         company_id: row.company_id,
         fiscal_year: row.fiscal_year,
@@ -255,8 +269,8 @@ function trialBalanceToNormalized(tbRows, fileName) {
         statement_scope: 'private_company',
         statement_type: statementTypeForMetric(group),
         account_name: row.account_name,
-        account_group: group,
-        account_subgroup: null,
+        account_group: mapping.group,
+        account_subgroup: mapping.subgroup || null,
         industry_metric: 'private_trial_balance',
         note: 'Derived from private company trial balance',
         original_amount: amount,
@@ -271,12 +285,21 @@ function trialBalanceToNormalized(tbRows, fileName) {
         source_row: row.source_row,
         source_column: null,
         source_cell: null,
-        mapping_confidence: group === 'other' ? 0.3 : 0.85,
-        mapping_source: group === 'other' ? 'unknown' : 'parser_rule',
-        suggested_account_group: group,
-        suggested_account_subgroup: group,
-        review_reason: group === 'other' ? 'Unknown private-company account mapping.' : null,
-        needs_review: group === 'other',
+        mapping_confidence: mapping.confidence,
+        mapping_source: mapping.mapping_source,
+        suggested_account_group: mapping.group,
+        suggested_account_subgroup: mapping.subgroup || null,
+        review_reason: mapping.review_reason || mapping.standard_reason || null,
+        needs_review: group === 'other' || Number(mapping.confidence || 0) < 0.86,
+        accounting_standard_profile: mapping.accounting_standard_profile,
+        standard_source: mapping.standard_source,
+        standard_ref: mapping.standard_ref,
+        standard_label_th: mapping.standard_label_th,
+        standard_label_en: mapping.standard_label_en,
+        standard_chapter: mapping.standard_chapter,
+        standard_reason: mapping.standard_reason,
+        consolidation_indicator: mapping.consolidation_indicator,
+        business_combination_indicator: mapping.business_combination_indicator,
       };
     });
 }
@@ -335,6 +358,7 @@ export function parsePrivateWorkbook(workbook, companyId, fileName = '', sourceT
   summary.normalizedRows = normalizedRows.length;
   summary.rows = monthlyRows.length + trialBalanceRows.length + normalizedRows.length;
   summary.reviewCount = normalizedRows.filter(row => row.needs_review).length;
+  summary.standardsQuality = evaluateTfrsDataQuality(normalizedRows, { profile: 'TFRS_NPAE' });
 
   return { monthlyRows, trialBalanceRows, normalizedRows, summary };
 }

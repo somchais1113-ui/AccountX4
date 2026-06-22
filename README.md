@@ -435,3 +435,29 @@ Run this extra migration after v1.7.6/1.7.7/1.7.8 migrations if you want the add
 ```text
 supabase/migrations/202606230002_export_security_hardening.sql
 ```
+
+## v1.8.0 — TFRS Standards Layer
+
+This release adds a deterministic accounting standards layer based on the uploaded TFRS references.
+
+What is included:
+
+- `src/lib/accountingStandards.js` with TFRS profile detection, taxonomy mapping, standards references, and data-quality scoring.
+- TFRS for NPAEs taxonomy for private companies / DBD-style files / trial balance imports.
+- TFRS 10 signal detection for consolidated statements, subsidiaries, non-controlling interests, and intercompany eliminations.
+- TFRS 3 signal detection for business combinations, goodwill, bargain purchase, acquisition-date and fair-value signals.
+- Parser rows now carry optional standards metadata such as `accounting_standard_profile`, `standard_ref`, `standard_label_th`, `standard_reason`, `consolidation_indicator`, and `business_combination_indicator`.
+- Excel Export now includes **Data Quality** and **TFRS Mapping Reference** sheets.
+- Import batches can store `standard_validation_summary` and `data_quality_score` after the migration is run.
+
+Safety rules:
+
+- TFRS layer is used for classification/explanation/validation only.
+- It does not create or adjust financial statement figures.
+- If a standards-based match is not approved by the user, it can still stay in Review depending on confidence/source.
+
+Run this migration after v1.7.9:
+
+```text
+supabase/migrations/202606230003_tfrs_standards_layer.sql
+```

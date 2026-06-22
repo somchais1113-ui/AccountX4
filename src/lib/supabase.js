@@ -1,4 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
+import { inferAccountingStandardProfile } from "./accountingStandards.js";
 
 // Vite exposes only variables that start with VITE_ to browser code.
 // Values are embedded at build time, so Vercel/Netlify must be redeployed after env changes.
@@ -33,6 +34,15 @@ const OPTIONAL_MAPPING_COLUMNS = new Set([
   'suggested_account_group',
   'suggested_account_subgroup',
   'review_reason',
+  'accounting_standard_profile',
+  'standard_source',
+  'standard_ref',
+  'standard_label_th',
+  'standard_label_en',
+  'standard_chapter',
+  'standard_reason',
+  'consolidation_indicator',
+  'business_combination_indicator',
 ]);
 
 const OPTIONAL_APPROVAL_COLUMNS = new Set([
@@ -42,6 +52,10 @@ const OPTIONAL_APPROVAL_COLUMNS = new Set([
   'approved_at',
   'usage_count',
   'last_used_at',
+  'standard_ref',
+  'standard_source',
+  'standard_label_th',
+  'standard_label_en',
 ]);
 
 function stripColumns(row, columns) {
@@ -146,12 +160,12 @@ export async function loadCompanies() {
 
   let query = client
     .from("companies")
-    .select("id,name_th,name_en,currency,type,industry,group_id,ticker_symbol,fiscal_year_end,company_mode,legal_entity_type")
+    .select("id,name_th,name_en,currency,type,industry,group_id,ticker_symbol,fiscal_year_end,company_mode,legal_entity_type,accounting_standard_profile")
     .order("id");
   let { data, error } = await query;
 
   // Backward compatible fallback for databases that have not run the v1.5 private-company migration yet.
-  if (error && /company_mode|legal_entity_type|schema cache|Could not find/i.test(error.message || '')) {
+  if (error && /company_mode|legal_entity_type|accounting_standard_profile|schema cache|Could not find/i.test(error.message || '')) {
     const fallback = await client
       .from("companies")
       .select("id,name_th,name_en,currency,type,industry,group_id,ticker_symbol,fiscal_year_end")
@@ -179,6 +193,7 @@ export async function loadCompanies() {
     fiscalYearEnd: company.fiscal_year_end,
     companyMode: company.company_mode || (company.ticker_symbol ? 'public' : 'private'),
     legalEntityType: company.legal_entity_type || (company.company_mode === 'public' || company.ticker_symbol ? 'public_limited' : 'limited_company'),
+    accountingStandardProfile: company.accounting_standard_profile || inferAccountingStandardProfile(company),
     role: roles.get(company.id) || "viewer",
   }));
 }
@@ -195,11 +210,12 @@ export async function createCompany(company) {
     ticker_symbol: company.tickerSymbol || null,
     fiscal_year_end: company.fiscalYearEnd || '12-31',
     company_mode: company.companyMode || (company.tickerSymbol ? 'public' : 'private'),
-    legal_entity_type: company.legalEntityType || (company.companyMode === 'public' || company.tickerSymbol ? 'public_limited' : 'limited_company')
+    legal_entity_type: company.legalEntityType || (company.companyMode === 'public' || company.tickerSymbol ? 'public_limited' : 'limited_company'),
+    accounting_standard_profile: company.accountingStandardProfile || inferAccountingStandardProfile(company)
   };
   let { data, error } = await client.from("companies").insert(payload).select("id").single();
-  if (error && /company_mode|legal_entity_type|schema cache|Could not find/i.test(error.message || '')) {
-    const { company_mode, legal_entity_type, ...fallbackPayload } = payload;
+  if (error && /company_mode|legal_entity_type|accounting_standard_profile|schema cache|Could not find/i.test(error.message || '')) {
+    const { company_mode, legal_entity_type, accounting_standard_profile, ...fallbackPayload } = payload;
     const fallback = await client.from("companies").insert(fallbackPayload).select("id").single();
     data = fallback.data;
     error = fallback.error;
@@ -220,11 +236,12 @@ export async function updateCompany(id, company) {
     ticker_symbol: company.tickerSymbol || null,
     fiscal_year_end: company.fiscalYearEnd || '12-31',
     company_mode: company.companyMode || (company.tickerSymbol ? 'public' : 'private'),
-    legal_entity_type: company.legalEntityType || (company.companyMode === 'public' || company.tickerSymbol ? 'public_limited' : 'limited_company')
+    legal_entity_type: company.legalEntityType || (company.companyMode === 'public' || company.tickerSymbol ? 'public_limited' : 'limited_company'),
+    accounting_standard_profile: company.accountingStandardProfile || inferAccountingStandardProfile(company)
   };
   let { error } = await client.from("companies").update(payload).eq("id", id);
-  if (error && /company_mode|legal_entity_type|schema cache|Could not find/i.test(error.message || '')) {
-    const { company_mode, legal_entity_type, ...fallbackPayload } = payload;
+  if (error && /company_mode|legal_entity_type|accounting_standard_profile|schema cache|Could not find/i.test(error.message || '')) {
+    const { company_mode, legal_entity_type, accounting_standard_profile, ...fallbackPayload } = payload;
     const fallback = await client.from("companies").update(fallbackPayload).eq("id", id);
     error = fallback.error;
   }
@@ -658,6 +675,10 @@ async function upsertAccountMappings(client, companyId, rows = []) {
         industry_metric: row.industry_metric || null,
         is_approved: true,
         mapping_source: 'approved_mapping',
+        standard_ref: row.standard_ref || null,
+        standard_source: row.standard_source || null,
+        standard_label_th: row.standard_label_th || null,
+        standard_label_en: row.standard_label_en || null,
         last_used_at: new Date().toISOString(),
       };
     })
@@ -739,6 +760,9 @@ export async function saveImportBatch(companyId, batchDetails, normalizedDataRow
     source_type: batchDetails.sourceType || 'public_financial_statement',
     parser_profile: batchDetails.parserProfile || null,
     legal_entity_type: batchDetails.legalEntityType || null,
+    accounting_standard_profile: batchDetails.accountingStandardProfile || inferAccountingStandardProfile({}, batchDetails),
+    standard_validation_summary: batchDetails.standardValidationSummary || batchDetails.standardsQuality || null,
+    data_quality_score: batchDetails.dataQualityScore ?? batchDetails.standardsQuality?.score ?? null,
     file_hash: batchDetails.fileHash || null,
     file_size: batchDetails.fileSize || null,
     review_count: batchDetails.reviewCount ?? null,
@@ -746,8 +770,8 @@ export async function saveImportBatch(companyId, batchDetails, normalizedDataRow
     status: 'confirmed'
   };
   let { data: batch, error: batchError } = await client.from("import_batches").insert(batchPayload).select("id").single();
-  if (batchError && /source_type|parser_profile|legal_entity_type|file_hash|file_size|storage_path|total_rows|review_count|schema cache|Could not find/i.test(batchError.message || '')) {
-    const { source_type, parser_profile, legal_entity_type, file_hash, file_size, storage_path, validation_summary, review_count, total_rows, ...fallbackBatchPayload } = batchPayload;
+  if (batchError && /source_type|parser_profile|legal_entity_type|accounting_standard_profile|standard_validation_summary|data_quality_score|file_hash|file_size|storage_path|total_rows|review_count|schema cache|Could not find/i.test(batchError.message || '')) {
+    const { source_type, parser_profile, legal_entity_type, accounting_standard_profile, standard_validation_summary, data_quality_score, file_hash, file_size, storage_path, validation_summary, review_count, total_rows, ...fallbackBatchPayload } = batchPayload;
     const fallback = await client.from("import_batches").insert(fallbackBatchPayload).select("id").single();
     batch = fallback.data;
     batchError = fallback.error;
@@ -786,6 +810,15 @@ export async function saveImportBatch(companyId, batchDetails, normalizedDataRow
     suggested_account_subgroup: row.suggested_account_subgroup || row.account_subgroup || null,
     review_reason: row.review_reason || null,
     needs_review: row.needs_review,
+    accounting_standard_profile: row.accounting_standard_profile || batchDetails.accountingStandardProfile || inferAccountingStandardProfile({}, batchDetails),
+    standard_source: row.standard_source || null,
+    standard_ref: row.standard_ref || null,
+    standard_label_th: row.standard_label_th || null,
+    standard_label_en: row.standard_label_en || null,
+    standard_chapter: row.standard_chapter || null,
+    standard_reason: row.standard_reason || null,
+    consolidation_indicator: row.consolidation_indicator || null,
+    business_combination_indicator: row.business_combination_indicator || null,
     import_status: 'confirmed'
   }));
   
@@ -869,6 +902,9 @@ export async function savePrivateImportBatch(companyId, batchDetails, privatePay
     source_type: batchDetails.sourceType || 'private_company_file',
     parser_profile: batchDetails.parserProfile || 'PRIVATE_COMPANY_IMPORT_PACK_V1',
     legal_entity_type: batchDetails.legalEntityType || null,
+    accounting_standard_profile: batchDetails.accountingStandardProfile || inferAccountingStandardProfile({}, batchDetails),
+    standard_validation_summary: batchDetails.standardValidationSummary || batchDetails.standardsQuality || null,
+    data_quality_score: batchDetails.dataQualityScore ?? batchDetails.standardsQuality?.score ?? null,
     file_hash: batchDetails.fileHash || null,
     file_size: batchDetails.fileSize || null,
     total_rows: totalInputRows,
@@ -876,8 +912,8 @@ export async function savePrivateImportBatch(companyId, batchDetails, privatePay
     status: 'confirmed'
   };
   let { data: batch, error: batchError } = await client.from("import_batches").insert(batchPayload).select("id").single();
-  if (batchError && /source_type|parser_profile|legal_entity_type|file_hash|file_size|storage_path|total_rows|review_count|schema cache|Could not find/i.test(batchError.message || '')) {
-    const { source_type, parser_profile, legal_entity_type, file_hash, file_size, storage_path, validation_summary, review_count, total_rows, ...fallbackBatchPayload } = batchPayload;
+  if (batchError && /source_type|parser_profile|legal_entity_type|accounting_standard_profile|standard_validation_summary|data_quality_score|file_hash|file_size|storage_path|total_rows|review_count|schema cache|Could not find/i.test(batchError.message || '')) {
+    const { source_type, parser_profile, legal_entity_type, accounting_standard_profile, standard_validation_summary, data_quality_score, file_hash, file_size, storage_path, validation_summary, review_count, total_rows, ...fallbackBatchPayload } = batchPayload;
     const fallback = await client.from("import_batches").insert(fallbackBatchPayload).select("id").single();
     batch = fallback.data;
     batchError = fallback.error;
@@ -998,6 +1034,15 @@ export async function savePrivateImportBatch(companyId, batchDetails, privatePay
       suggested_account_subgroup: row.suggested_account_subgroup || row.account_subgroup || null,
       review_reason: row.review_reason || null,
       needs_review: row.needs_review,
+      accounting_standard_profile: row.accounting_standard_profile || batchDetails.accountingStandardProfile || inferAccountingStandardProfile({}, batchDetails),
+      standard_source: row.standard_source || null,
+      standard_ref: row.standard_ref || null,
+      standard_label_th: row.standard_label_th || null,
+      standard_label_en: row.standard_label_en || null,
+      standard_chapter: row.standard_chapter || null,
+      standard_reason: row.standard_reason || null,
+      consolidation_indicator: row.consolidation_indicator || null,
+      business_combination_indicator: row.business_combination_indicator || null,
       import_status: 'confirmed'
     }));
     const replaceKeys = new Set(payload.map((row) => [row.fiscal_year, row.period || 'FY', row.statement_scope || 'private_company'].join('|')));
@@ -1069,7 +1114,7 @@ export async function loadImportHistory(companyId = null, limit = 200) {
     .limit(limit);
   if (companyId) query = query.eq('company_id', companyId);
   let { data, error } = await query;
-  if (error && /source_type|parser_profile|legal_entity_type|file_hash|file_size|storage_path|total_rows|review_count|schema cache|Could not find/i.test(error.message || '')) {
+  if (error && /source_type|parser_profile|legal_entity_type|accounting_standard_profile|standard_validation_summary|data_quality_score|file_hash|file_size|storage_path|total_rows|review_count|schema cache|Could not find/i.test(error.message || '')) {
     let fallback = client
       .from('import_batches')
       .select('id,company_id,file_name,fiscal_year,period_type,period,statement_scope,status,imported_at,companies(name_th,name_en,ticker_symbol,industry,currency)')

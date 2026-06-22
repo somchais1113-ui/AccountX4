@@ -2104,10 +2104,10 @@ function ExportCenterPage({ companies, store, importHistory, currentCompanyId, c
       };
       const preview = previewFinancialExcelExport(exportOptions);
       const integrity = preview?.integrity || {};
-      if (integrity.hasIntegrityIssue || integrity.hasImportantReview) {
+      if (integrity.hasIntegrityIssue || integrity.hasImportantReview || integrity.hasTfrsQualityIssue) {
         const proceed = window.confirm(th
-          ? "พบ Warning ก่อน Export เช่น งบไม่สมดุล / ไม่มี FY / ยังมี Mapping Review ต้องการ Export anyway หรือไม่?"
-          : "Warnings were found before export, such as imbalanced statements / missing FY / mapping review items. Export anyway?"
+          ? "พบ Warning ก่อน Export เช่น งบไม่สมดุล / ไม่มี FY / ยังมี Mapping Review / Data Quality ต่ำ ต้องการ Export anyway หรือไม่?"
+          : "Warnings were found before export, such as imbalanced statements / missing FY / mapping review items / low data quality. Export anyway?"
         );
         if (!proceed) {
           setStatus({ loading:false, error:"", ok: th ? "ยกเลิก Export เพื่อให้ตรวจข้อมูลก่อน" : "Export cancelled so the data can be reviewed first." });
@@ -2122,6 +2122,11 @@ function ExportCenterPage({ companies, store, importHistory, currentCompanyId, c
         okMsg += th
           ? " — ⚠ พบงบที่ไม่สมดุล โปรดตรวจ Sheet ตรวจสอบงบ ก่อนใช้ตัวเลข"
           : " — ⚠ Statement imbalance found. Review the Integrity Checks sheet before using these figures.";
+      }
+      if (resultIntegrity.hasTfrsQualityIssue) {
+        okMsg += th
+          ? " — ⚠ โปรดตรวจ Sheet Data Quality / TFRS Mapping Reference"
+          : " — ⚠ Review the Data Quality / TFRS Mapping Reference sheets.";
       }
       setStatus({ loading:false, error:"", ok: okMsg });
     } catch (error) {

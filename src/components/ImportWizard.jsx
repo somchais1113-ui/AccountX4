@@ -124,7 +124,7 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
           return;
         }
         const primaryYear = summary?.primaryYear || rows[0].fiscal_year;
-        setBatchDetails(prev => ({ ...prev, fiscalYear: primaryYear, periodType: 'annual', period: 'FY', statementScope: rows[0].statement_scope || 'consolidated', sourceType, legalEntityType, parserProfile: summary?.parserVersion || 'IMPORT_PARSER_V3_INDUSTRY_PACK_V1', reviewCount: summary?.reviewCount || 0 }));
+        setBatchDetails(prev => ({ ...prev, fiscalYear: primaryYear, periodType: 'annual', period: 'FY', statementScope: rows[0].statement_scope || 'consolidated', sourceType, legalEntityType, parserProfile: summary?.parserVersion || 'IMPORT_PARSER_V3_INDUSTRY_PACK_V1', reviewCount: summary?.reviewCount || 0, accountingStandardProfile: summary?.standardsQuality ? 'TFRS_PAE' : undefined, standardsQuality: summary?.standardsQuality || null, dataQualityScore: summary?.standardsQuality?.score ?? null }));
         setPrivatePayload(null);
         setParseSummary(summary);
         setParsedData(rows);
@@ -177,6 +177,9 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
         legalEntityType,
         parserProfile: summary.parserVersion || 'PRIVATE_COMPANY_IMPORT_PACK_V1',
         reviewCount: summary.reviewCount || 0,
+        accountingStandardProfile: 'TFRS_NPAE',
+        standardsQuality: summary.standardsQuality || null,
+        dataQualityScore: summary.standardsQuality?.score ?? null,
       }));
       setPrivatePayload(payload);
       setParsedData(previewRows);

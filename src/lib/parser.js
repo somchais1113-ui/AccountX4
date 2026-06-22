@@ -1,4 +1,5 @@
 import * as XLSX from 'xlsx';
+import { applyTfrsStandardMetadata, evaluateTfrsDataQuality } from './accountingStandards.js';
 
 /**
  * Industry Import Parser v3 / Industry Parser Pack v1
@@ -128,6 +129,13 @@ export const CORE_GROUPS = {
   cash_beginning: ['เงินสดและรายการเทียบเท่าเงินสดต้นปี', 'cash at beginning'],
   cash_ending: ['เงินสดและรายการเทียบเท่าเงินสดปลายปี', 'cash at end'],
   non_cash_transactions: ['รายการที่ไม่ใช่เงินสด', 'non-cash transactions'],
+
+  // TFRS standards-layer supporting groups
+  goodwill: ['ค่าความนิยม', 'goodwill'],
+  non_controlling_interests: ['ส่วนได้เสียที่ไม่มีอำนาจควบคุม', 'non-controlling interests'],
+  gain_on_bargain_purchase: ['กำไรจากการต่อรองราคาซื้อ', 'bargain purchase'],
+  business_combination_item: ['การรวมธุรกิจ', 'business combination'],
+  consolidation_elimination: ['รายการระหว่างกัน', 'intercompany', 'elimination'],
 };
 
 const SECTION_LABELS = {
@@ -212,6 +220,10 @@ const ACCOUNTING_DICTIONARY_RULES = [
   { any: ['กำไรขาดทุนเบ็ดเสร็จอื่น', 'กําไรขาดทุนเบ็ดเสร็จอื่น', 'other comprehensive income'], group: 'other_comprehensive_income', subgroup: 'other_comprehensive_income', confidence: 0.9 },
   { any: ['รวมกำไรขาดทุนเบ็ดเสร็จ', 'รวมกําไรขาดทุนเบ็ดเสร็จ', 'กำไรเบ็ดเสร็จรวมสำหรับปี', 'กําไรเบ็ดเสร็จรวมสําหรับปี', 'total comprehensive income'], group: 'total_comprehensive_income', subgroup: 'total_comprehensive_income', confidence: 0.9 },
   { any: ['ส่วนได้เสียที่ไม่มีอำนาจควบคุม', 'ส่วนได้เสียที่ไม่มีอํานาจควบคุม', 'non-controlling interests', 'non controlling interests'], group: 'non_controlling_interests', subgroup: 'non_controlling_interests', confidence: 0.9 },
+  { any: ['ค่าความนิยม', 'goodwill'], group: 'goodwill', subgroup: 'goodwill', confidence: 0.93 },
+  { any: ['กำไรจากการต่อรองราคาซื้อ', 'กําไรจากการต่อรองราคาซื้อ', 'bargain purchase'], group: 'gain_on_bargain_purchase', subgroup: 'bargain_purchase_gain', confidence: 0.9 },
+  { any: ['การรวมธุรกิจ', 'business combination'], group: 'business_combination_item', subgroup: 'business_combination', confidence: 0.86 },
+  { any: ['รายการระหว่างกัน', 'ตัดรายการระหว่างกัน', 'intercompany', 'elimination'], group: 'consolidation_elimination', subgroup: 'intercompany_elimination', confidence: 0.86 },
   { any: ['สำรองรายการป้องกันความเสี่ยง', 'สํารองรายการป้องกันความเสี่ยง', 'สำรองรายการประกันความเสี่ยง', 'สํารองรายการประกันความเสี่ยง', 'cash flow hedge reserve', 'hedging reserve'], group: 'oci_cash_flow_hedge', subgroup: 'cash_flow_hedge_oci', confidence: 0.88 },
   { any: ['การเปลี่ยนแปลงในสำรองรายการป้องกันความเสี่ยง', 'การเปลี่ยนแปลงในสํารองรายการป้องกันความเสี่ยง', 'การเปลี่ยนแปลงในสำรองรายการประกันความเสี่ยง', 'การเปลี่ยนแปลงในสํารองรายการประกันความเสี่ยง'], group: 'oci_cash_flow_hedge', subgroup: 'cash_flow_hedge_oci', confidence: 0.88 },
   { all: ['กำไรจากการขายเงินลงทุน', 'มูลค่ายุติธรรม'], group: 'other_comprehensive_income', subgroup: 'fair_value_oci_investment_gain', confidence: 0.86 },
@@ -773,7 +785,8 @@ function mapEquityComponent(component) {
 
 function autoMapAccount(accountName, statementType, section = '') {
   const label = normalizeText(accountName);
-  if (!label) return withMappingMeta({ group: 'other', subgroup: null, confidence: 0.3 }, 'unknown', 'Blank account name.');
+  const standardize = (mapping) => applyTfrsStandardMetadata({ label, statementType, section, mapping });
+  if (!label) return standardize(withMappingMeta({ group: 'other', subgroup: null, confidence: 0.3 }, 'unknown', 'Blank account name.'));
 
   const dictionaryMatch = dictionaryMapAccount(label);
   let parserMatch = null;
@@ -782,19 +795,19 @@ function autoMapAccount(accountName, statementType, section = '') {
   else if (statementType === 'cash_flow') parserMatch = mapCashFlow(label, section);
   else if (statementType === 'equity_statement') parserMatch = { group: 'other', subgroup: 'equity_statement_detail', confidence: 0.55, mapping_source: 'unknown' };
 
-  // Keep existing high-confidence parser behavior for stable master files.
-  // Use the dictionary only when parser is missing/weak/Other so it can preselect a better suggestion with Review warning.
-  if (parserMatch && parserMatch.group !== 'other' && Number(parserMatch.confidence || 0) >= 0.9) return withMappingMeta(parserMatch, 'parser_rule');
-  if (dictionaryMatch && (!parserMatch || parserMatch.group === 'other' || Number(dictionaryMatch.confidence || 0) >= Number(parserMatch.confidence || 0))) return dictionaryMatch;
-  if (parserMatch) return withMappingMeta(parserMatch, 'parser_rule');
+  // Keep existing high-confidence parser behavior for stable master files, but attach
+  // TFRS metadata so Mapping Center and Export can explain the basis.
+  if (parserMatch && parserMatch.group !== 'other' && Number(parserMatch.confidence || 0) >= 0.9) return standardize(withMappingMeta(parserMatch, 'parser_rule'));
+  if (dictionaryMatch && (!parserMatch || parserMatch.group === 'other' || Number(dictionaryMatch.confidence || 0) >= Number(parserMatch.confidence || 0))) return standardize(dictionaryMatch);
+  if (parserMatch) return standardize(withMappingMeta(parserMatch, 'parser_rule'));
 
   // Generic fallback for simple CSV templates.
   const t = normalizeForMatch(label);
   for (const [group, keywords] of Object.entries(CORE_GROUPS)) {
-    if (keywords.some((keyword) => t === normalizeForMatch(keyword))) return withMappingMeta({ group, subgroup: group, confidence: 0.92 }, 'parser_rule');
-    if (keywords.some((keyword) => t.includes(normalizeForMatch(keyword)))) return withMappingMeta({ group, subgroup: group, confidence: 0.72 }, 'ai_similarity');
+    if (keywords.some((keyword) => t === normalizeForMatch(keyword))) return standardize(withMappingMeta({ group, subgroup: group, confidence: 0.92 }, 'parser_rule'));
+    if (keywords.some((keyword) => t.includes(normalizeForMatch(keyword)))) return standardize(withMappingMeta({ group, subgroup: group, confidence: 0.72 }, 'ai_similarity'));
   }
-  return withMappingMeta({ group: 'other', subgroup: null, confidence: 0.5 }, 'unknown');
+  return standardize(withMappingMeta({ group: 'other', subgroup: null, confidence: 0.5 }, 'unknown'));
 }
 
 function removeOutOfWindowHistoricalRows(rows) {
@@ -970,6 +983,15 @@ function parseStandardStatementSheet(rows, sheetName, companyId, fileName) {
         suggested_account_subgroup: mapping.subgroup || detectSubgroupFromText(sectionText),
         review_reason: reviewReason,
         needs_review: needsReview,
+        accounting_standard_profile: mapping.accounting_standard_profile || null,
+        standard_source: mapping.standard_source || null,
+        standard_ref: mapping.standard_ref || null,
+        standard_label_th: mapping.standard_label_th || null,
+        standard_label_en: mapping.standard_label_en || null,
+        standard_chapter: mapping.standard_chapter || null,
+        standard_reason: mapping.standard_reason || null,
+        consolidation_indicator: mapping.consolidation_indicator || null,
+        business_combination_indicator: mapping.business_combination_indicator || null,
       });
     });
   }
@@ -1035,6 +1057,15 @@ function parseEquityStatementSheet(rows, sheetName, companyId, fileName) {
         suggested_account_subgroup: mapEquityComponent(component).subgroup,
         review_reason: null,
         needs_review: false,
+        accounting_standard_profile: 'TFRS_NPAE',
+        standard_source: 'TFRS_NPAE',
+        standard_ref: mapEquityComponent(component).group === 'equity_legal_reserve' ? 'TFRS_NPAE_CONCEPT_3.18.3' : null,
+        standard_label_th: mapEquityComponent(component).group === 'equity_legal_reserve' ? 'ทุนสำรองตามกฎหมาย' : null,
+        standard_label_en: mapEquityComponent(component).group === 'equity_legal_reserve' ? 'Legal reserve' : null,
+        standard_chapter: mapEquityComponent(component).group === 'equity_legal_reserve' ? '3' : null,
+        standard_reason: mapEquityComponent(component).group === 'equity_legal_reserve' ? 'TFRS_NPAE: equity component matched legal reserve concept.' : null,
+        consolidation_indicator: null,
+        business_combination_indicator: null,
       });
     }
   }
@@ -1090,9 +1121,10 @@ function makeSummary(rows, workbook, fileName) {
   const mappedCount = rows.filter((row) => !row.needs_review).length;
   const reviewCount = rows.length - mappedCount;
   const integrity = validateParsedIntegrity(rows);
+  const standardsQuality = evaluateTfrsDataQuality(rows);
   return {
     fileName,
-    parserVersion: 'IMPORT_PARSER_V3_INDUSTRY_PACK_V1',
+    parserVersion: 'IMPORT_PARSER_V4_TFRS_STANDARDS_LAYER_V1',
     sheets,
     years,
     primaryYear: years[0] || new Date().getFullYear(),
@@ -1102,6 +1134,7 @@ function makeSummary(rows, workbook, fileName) {
     mappedCount,
     reviewCount,
     integrity,
+    standardsQuality,
   };
 }
 

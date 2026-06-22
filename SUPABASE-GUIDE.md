@@ -327,3 +327,27 @@ supabase/migrations/202606230002_export_security_hardening.sql
 This migration is idempotent and does not delete data. It re-enables RLS on `alert_events` and `line_alert_settings` and re-scopes policies by `company_members`.
 
 Do not run any `pg_cron` / LINE scheduled alert migration yet. Scheduled LINE dispatch is intentionally paused until the alert workflow is ready.
+
+## v1.8.0 TFRS Standards Layer Migration
+
+After deploying v1.8.0, run this SQL file in Supabase SQL Editor:
+
+```text
+supabase/migrations/202606230003_tfrs_standards_layer.sql
+```
+
+This migration is safe and idempotent. It only adds standards metadata columns and indexes:
+
+- `companies.accounting_standard_profile`
+- standards metadata on `normalized_financial_data`
+- `import_batches.standard_validation_summary`
+- `import_batches.data_quality_score`
+- standards reference metadata on `account_mappings`
+
+It does not delete data and does not rewrite financial statement figures. Existing companies are assigned a default profile using company mode/legal entity/ticker logic:
+
+- public / public_limited / ticker present → `TFRS_PAE`
+- private / limited company / partnership → `TFRS_NPAE`
+- otherwise → `UNKNOWN`
+
+The TFRS layer is then used by Parser, Mapping Center data, Data Quality scoring, and Excel Export reference sheets.
