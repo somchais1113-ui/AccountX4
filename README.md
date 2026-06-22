@@ -1,3 +1,13 @@
+## v1.5.2 Slide Workspace + Toggle UI
+
+- Built from `finanalytics-v1.5-private-company-pack-checked.zip`.
+- Adds the new Slide Workspace layout: left-side Data Source and right-side Presentation Side.
+- Adds segmented toggles for Data Input / Presentation and Upload / Official / Saved source modes.
+- Embeds the existing Import Wizard into the Slide Workspace upload source so the slide page can import data without leaving the context.
+- Adds Official Source placeholder UI for future SET/DBD/API connectors without relying on scraping.
+- Adds saved import/history cards and slide outline controls.
+- Updates slide visuals to avoid black primary bars and keeps Assets in blue.
+
 
 ## v3.1 Save UX Hotfix
 

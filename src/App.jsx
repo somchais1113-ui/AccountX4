@@ -295,6 +295,25 @@ function MetricPill({label, value, formula, forceColor}) {
   );
 }
 
+
+function SegmentedToggle({ options, value, onChange, compact=false, style={} }) {
+  const C = useC();
+  return (
+    <div style={{display:"inline-flex",alignItems:"center",gap:3,padding:3,borderRadius:999,background:C.surface,border:`1px solid ${C.border}`,...style}}>
+      {options.map((option)=>{
+        const active = value === option.value;
+        return (
+          <button key={option.value} type="button" onClick={()=>onChange(option.value)}
+            style={{border:"none",borderRadius:999,padding:compact?"6px 10px":"8px 14px",background:active?C.accent:"transparent",color:active?"#fff":C.muted,fontSize:compact?12:13,fontWeight:800,cursor:"pointer",whiteSpace:"nowrap",display:"inline-flex",alignItems:"center",gap:6,boxShadow:active?"0 8px 20px #00000022":"none"}}>
+            {option.icon && <span>{option.icon}</span>}
+            <span>{option.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 // PAGE HEADER (bigger, bolder)
 function PageHeader({title, subtitle}) {
   const C = useC();
@@ -968,28 +987,54 @@ function IndustryPage({store, year, lang}) {
 // ═══════════════════════════════════════════════════════════
 // SLIDE TEMPLATE
 // ═══════════════════════════════════════════════════════════
-function SlideViewer({store, companyId, year, lang}) {
+function SlideViewer({store, companyId, year, lang, onImportSuccess, onGoUpload, theme}) {
   const C = useC();
   const th = lang==="th";
-  const company = COMPANIES.find(c=>c.id===companyId);
-  const cur = company.currency;
-  const data = DataEngine.getYearData(store, companyId, year);
-  const prev = DataEngine.getYearData(store, companyId, year-1);
-  const hasData = DataEngine.countMonths(store, companyId, year) > 0;
+  const company = COMPANIES.find(c=>c.id===companyId) || COMPANIES[0];
+  const cur = company?.currency || "THB";
+  const displayYear = DataEngine.getDisplayYear(store, companyId, year);
+  const data = DataEngine.getYearData(store, companyId, displayYear);
+  const prev = DataEngine.getYearData(store, companyId, displayYear-1);
+  const hasAnnual = DataEngine.hasNormalizedAnnualData(store, companyId, displayYear);
+  const annualRows = DataEngine.getAnnualRows(store, companyId);
+  const selectedAnnual = DataEngine.getAnnualMetrics(store, companyId, displayYear);
+  const previousAnnual = annualRows.find(row => Number(row.year) === Number(displayYear)-1) || null;
+  const hasData = DataEngine.countMonths(store, companyId, displayYear) > 0 || annualRows.length > 0;
   const SD = "#0F1528", ST = "#E4E8FF", SM = "#6B7299", SB = "#252A42";
+  const [workspaceMode, setWorkspaceMode] = useState("input");
+  const [sourceMode, setSourceMode] = useState("upload");
+  const [activeSlide, setActiveSlide] = useState(1);
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState("");
 
   const latestIdx = useMemo(()=>{
-    const m = Object.keys(store?.[companyId]?.[year]||{}).map(Number);
-    return m.length ? Math.max(...m) : 5;
-  },[store,companyId,year]);
+    let idx = 0;
+    data.forEach((row, rowIdx)=>{
+      const hasValue = ["revenue","expense","cashIn","cashOut","loanBalance"].some(key => Math.abs(Number(row?.[key]) || 0) > 0);
+      if (hasValue) idx = rowIdx;
+    });
+    return idx;
+  },[data]);
 
-  const m = useMemo(()=>{
-    const latest = data[latestIdx], prevMon = latestIdx>0?data[latestIdx-1]:null;
+  const monthlyMetrics = useMemo(()=>{
+    const latest = data[latestIdx] || {};
+    const prevMon = latestIdx>0 ? data[latestIdx-1] : null;
     return {
-      revenue:latest.revenue, expense:latest.expense, cashIn:latest.cashIn,
-      netProfit:FinanceMath.netProfit(latest), margin:FinanceMath.margin(latest), loanBal:latest.loanBalance,
-      MOM_rev:prevMon?FinanceMath.MOM(latest.revenue,prevMon.revenue):null,
-      YOY_rev:prev[latestIdx].revenue?FinanceMath.YOY(latest.revenue,prev[latestIdx].revenue):null,
+      revenue:num(latest.revenue),
+      expense:num(latest.expense),
+      cashIn:num(latest.cashIn),
+      cashOut:num(latest.cashOut),
+      netProfit:FinanceMath.netProfit(latest),
+      margin:FinanceMath.margin(latest),
+      asset:num(latest.asset || latest.annualMetrics?.asset),
+      liability:num(latest.liability || latest.annualMetrics?.liability),
+      equity:num(latest.equity || latest.annualMetrics?.equity),
+      loanBal:num(latest.loanBalance),
+      operatingCashFlow:num(latest.operatingCashFlow || latest.annualMetrics?.operatingCashFlow || latest.cashIn - latest.cashOut),
+      investingCashFlow:num(latest.investingCashFlow || latest.annualMetrics?.investingCashFlow),
+      financingCashFlow:num(latest.financingCashFlow || latest.annualMetrics?.financingCashFlow),
+      MOM_rev:prevMon ? FinanceMath.MOM(latest.revenue,prevMon.revenue) : null,
+      YOY_rev:prev?.[latestIdx]?.revenue ? FinanceMath.YOY(latest.revenue,prev[latestIdx].revenue) : null,
       QOQ_rev:FinanceMath.QOQ(data,"revenue",Math.floor(latestIdx/3)),
       YTD_rev:FinanceMath.YTD(data.slice(0,latestIdx+1),"revenue"),
       LTM_rev:FinanceMath.LTM(data,"revenue"),
@@ -997,21 +1042,58 @@ function SlideViewer({store, companyId, year, lang}) {
     };
   },[data,prev,latestIdx]);
 
+  const annualCagr = useMemo(()=>{
+    if (annualRows.length < 2) return null;
+    const sorted = [...annualRows].sort((a,b)=>a.year-b.year).filter(row => Number(row.revenue) > 0);
+    if (sorted.length < 2) return null;
+    const first = sorted[0];
+    const last = sorted[sorted.length-1];
+    const years = Math.max(1, Number(last.year) - Number(first.year));
+    return FinanceMath.CAGR(first.revenue, last.revenue, years);
+  },[annualRows]);
+
+  const m = hasAnnual ? {
+    revenue:selectedAnnual.revenue,
+    expense:selectedAnnual.expense,
+    cashIn:selectedAnnual.operatingCashFlow > 0 ? selectedAnnual.operatingCashFlow : 0,
+    cashOut:selectedAnnual.operatingCashFlow < 0 ? Math.abs(selectedAnnual.operatingCashFlow) : 0,
+    netProfit:selectedAnnual.netProfit,
+    margin:selectedAnnual.margin,
+    asset:selectedAnnual.asset,
+    liability:selectedAnnual.liability,
+    equity:selectedAnnual.equity,
+    loanBal:selectedAnnual.loan,
+    operatingCashFlow:selectedAnnual.operatingCashFlow,
+    investingCashFlow:selectedAnnual.investingCashFlow,
+    financingCashFlow:selectedAnnual.financingCashFlow,
+    MOM_rev:null,
+    QOQ_rev:null,
+    YOY_rev:previousAnnual ? FinanceMath.YOY(selectedAnnual.revenue, previousAnnual.revenue) : null,
+    YTD_rev:selectedAnnual.revenue,
+    LTM_rev:selectedAnnual.revenue,
+    CAGR_rev:annualCagr,
+  } : monthlyMetrics;
+
+  const periodLabel = hasAnnual ? `FY ${displayYear}` : `${MONTHS[latestIdx]?.[th?"th":"en"] || "FY"} ${displayYear}`;
+  const ticker = company?.tickerSymbol || company?.ticker_symbol || company?.nameEn || company?.nameTh || "-";
+  const debtToEquity = m.equity ? (m.liability / m.equity) : null;
+  const cashQuality = m.netProfit ? (m.operatingCashFlow / m.netProfit) : null;
+  const balanceGap = Math.abs(num(m.asset) - (num(m.liability) + num(m.equity)));
+  const balanceGapPct = m.asset ? (balanceGap / Math.abs(m.asset)) * 100 : null;
+
   const SLIDES = [
-    {id:1,type:"cover",th:"หน้าปก",en:"Cover"},
-    {id:2,type:"executive",th:"สรุปผู้บริหาร",en:"Executive Summary"},
-    {id:3,type:"momentum",th:"โมเมนตัม",en:"Momentum"},
-    {id:4,type:"cashflow",th:"กระแสเงินสด",en:"Cashflow"},
+    {id:1,type:"cover",th:"หน้าปก",en:"Cover",descTh:"ชื่อบริษัทและช่วงเวลาวิเคราะห์",descEn:"Company and reporting period"},
+    {id:2,type:"executive",th:"สรุปผู้บริหาร",en:"Executive Summary",descTh:"ตัวเลขสำคัญและสาระหลัก",descEn:"Key metrics and headline insights"},
+    {id:3,type:"momentum",th:"โมเมนตัม",en:"Momentum",descTh:"การเติบโต YoY / Margin / CAGR",descEn:"YoY growth, margin and CAGR"},
+    {id:4,type:"cashflow",th:"กระแสเงินสด",en:"Cashflow",descTh:"คุณภาพกำไรและกระแสเงินสด",descEn:"Cash generation and cash quality"},
   ];
-  const [activeSlide, setActiveSlide] = useState(1);
-  const [exporting, setExporting] = useState(false);
-  const [exportError, setExportError] = useState("");
   const slide = SLIDES[activeSlide-1];
+
   const handleExport = async () => {
     setExporting(true); setExportError("");
     try {
       const { exportFinancialPptx } = await import("./lib/exportPptx.js");
-      await exportFinancialPptx({ company, year, data, previousData:prev, language:lang, financeMath:FinanceMath });
+      await exportFinancialPptx({ company, year:displayYear, data, previousData:prev, language:lang, financeMath:FinanceMath });
     } catch (error) {
       setExportError(error.message || "PPTX export failed");
     } finally {
@@ -1019,29 +1101,19 @@ function SlideViewer({store, companyId, year, lang}) {
     }
   };
 
-  if (!hasData) {
-    return (
-      <Card style={{textAlign:"center",padding:48}}>
-        <div style={{fontSize:34,marginBottom:12}}>🖥</div>
-        <div style={{fontSize:18,fontWeight:700,color:C.white,marginBottom:6}}>{th?"ยังไม่มีข้อมูลสำหรับสร้างสไลด์":"No data to generate slides"}</div>
-        <div style={{fontSize:14,color:C.muted}}>{th?"อัปโหลดข้อมูลของบริษัทนี้ก่อน":"Upload data first"}</div>
-      </Card>
-    );
-  }
-
-  const sbase = {width:"100%",aspectRatio:"16/9",background:SD,borderRadius:12,overflow:"hidden",position:"relative",fontFamily:F.sans};
   const clrP = (n)=>n===null||isNaN(n)?SM:n>0?"#1FD9A4":n<0?"#F7637C":SM;
+  const sbase = {width:"100%",aspectRatio:"16/9",background:SD,borderRadius:12,overflow:"hidden",position:"relative",fontFamily:F.sans};
 
   const renderSlide = () => {
     if (slide.type==="cover") return (
       <div style={{...sbase,display:"flex",flexDirection:"column",justifyContent:"center",alignItems:"center",background:"linear-gradient(135deg,#0F1528 0%,#1a1f40 100%)"}}>
-        <div style={{position:"absolute",top:0,left:0,right:0,height:4,background:"linear-gradient(90deg,#5B7CFA,#1FD9A4)"}}/>
+        <div style={{position:"absolute",top:0,left:0,right:0,height:4,background:"linear-gradient(90deg,#5B7CFA,#38BDF8,#1FD9A4)"}}/>
         <div style={{textAlign:"center",padding:40}}>
-          <div style={{fontSize:11,color:"#5B7CFA",letterSpacing:"0.2em",textTransform:"uppercase",marginBottom:16,fontWeight:700}}>MONTHLY FINANCIAL REPORT</div>
+          <div style={{fontSize:11,color:"#38BDF8",letterSpacing:"0.2em",textTransform:"uppercase",marginBottom:16,fontWeight:700}}>FINANCIAL PRESENTATION WORKSPACE</div>
           <div style={{fontSize:34,fontWeight:800,color:"#fff",marginBottom:8}}>{th?company.nameTh:company.nameEn}</div>
-          <div style={{fontSize:17,color:SM,marginBottom:32}}>{MONTHS[latestIdx][th?"th":"en"]} {year} (พ.ศ.{year+543})</div>
-          <div style={{display:"flex",gap:20,justifyContent:"center"}}>
-            {[{l:th?"รายได้ YTD":"YTD Revenue",v:fmt(m.YTD_rev,cur)},{l:"Margin",v:`${m.margin.toFixed(1)}%`},{l:"CAGR",v:fmtPct(m.CAGR_rev)}].map((s,i)=>(
+          <div style={{fontSize:17,color:SM,marginBottom:32}}>{periodLabel} · {company.currency}</div>
+          <div style={{display:"flex",gap:20,justifyContent:"center",flexWrap:"wrap"}}>
+            {[{l:th?"รายได้":"Revenue",v:fmt(m.revenue,cur)},{l:th?"กำไรสุทธิ":"Net Profit",v:fmt(m.netProfit,cur)},{l:th?"สินทรัพย์":"Assets",v:fmt(m.asset,cur)}].map((s,i)=>(
               <div key={i} style={{textAlign:"center",padding:"12px 20px",border:`1px solid ${SB}`,borderRadius:10,background:"#ffffff08"}}>
                 <div style={{fontSize:11,color:SM,marginBottom:4}}>{s.l}</div><div style={{fontSize:19,fontWeight:800,color:"#fff"}}>{s.v}</div>
               </div>
@@ -1053,24 +1125,22 @@ function SlideViewer({store, companyId, year, lang}) {
     );
     if (slide.type==="executive") return (
       <div style={{...sbase,padding:32}}>
-        <div style={{position:"absolute",top:0,left:0,right:0,height:3,background:"linear-gradient(90deg,#5B7CFA,#1FD9A4)"}}/>
-        <div style={{fontSize:11,color:"#5B7CFA",letterSpacing:"0.15em",textTransform:"uppercase",marginBottom:8}}>EXECUTIVE SUMMARY</div>
-        <div style={{fontSize:21,fontWeight:800,color:"#fff",marginBottom:18}}>{th?"สรุปผู้บริหาร":"Key Highlights"} · {MONTHS[latestIdx][th?"th":"en"]} {year}</div>
+        <div style={{position:"absolute",top:0,left:0,right:0,height:3,background:"linear-gradient(90deg,#5B7CFA,#38BDF8,#1FD9A4)"}}/>
+        <div style={{fontSize:11,color:"#38BDF8",letterSpacing:"0.15em",textTransform:"uppercase",marginBottom:8}}>EXECUTIVE SUMMARY</div>
+        <div style={{fontSize:21,fontWeight:800,color:"#fff",marginBottom:18}}>{th?"สรุปผู้บริหาร":"Key Highlights"} · {periodLabel}</div>
         <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:16}}>
-          {[{l:th?"รายได้":"Revenue",v:fmt(m.revenue,cur),mom:m.MOM_rev,yoy:m.YOY_rev,c:"#5B7CFA"},{l:th?"กำไรสุทธิ":"Net Profit",v:fmt(m.netProfit,cur),sub:`Margin ${m.margin.toFixed(1)}%`,c:"#1FD9A4"},{l:th?"เงินสดรับ":"Cash In",v:fmt(m.cashIn,cur),c:"#A78BFA"}].map((k,i)=>(
+          {[{l:th?"รายได้":"Revenue",v:fmt(m.revenue,cur),sub:`YoY ${fmtPct(m.YOY_rev)}`,c:"#5B7CFA"},{l:th?"กำไรสุทธิ":"Net Profit",v:fmt(m.netProfit,cur),sub:`Margin ${m.margin.toFixed(1)}%`,c:"#1FD9A4"},{l:th?"สินทรัพย์":"Assets",v:fmt(m.asset,cur),sub:`D/E ${debtToEquity==null?"N/A":debtToEquity.toFixed(2)}x`,c:"#38BDF8"}].map((k,i)=>(
             <div key={i} style={{background:"#ffffff06",border:`1px solid ${SB}`,borderRadius:10,padding:14,borderTop:`2px solid ${k.c}`}}>
               <div style={{fontSize:10,color:SM,marginBottom:4,textTransform:"uppercase"}}>{k.l}</div>
               <div style={{fontSize:17,fontWeight:800,color:"#fff",marginBottom:6}}>{k.v}</div>
-              {k.mom!=null && <div style={{fontSize:11,color:clrP(k.mom)}}>MOM {fmtPct(k.mom)}</div>}
-              {k.yoy!=null && <div style={{fontSize:11,color:clrP(k.yoy)}}>YOY {fmtPct(k.yoy)}</div>}
-              {k.sub && <div style={{fontSize:11,color:SM}}>{k.sub}</div>}
+              <div style={{fontSize:11,color:i===0?clrP(m.YOY_rev):SM}}>{k.sub}</div>
             </div>
           ))}
         </div>
         <div style={{background:"#ffffff06",border:`1px solid ${SB}`,borderRadius:10,padding:14}}>
-          <div style={{fontSize:11,color:SM,marginBottom:8,textTransform:"uppercase",letterSpacing:"0.05em"}}>{th?"ตัวชี้วัดสะสม":"Cumulative Indicators"}</div>
+          <div style={{fontSize:11,color:SM,marginBottom:8,textTransform:"uppercase",letterSpacing:"0.05em"}}>{th?"ตัวชี้วัดสำคัญ":"Key Indicators"}</div>
           <div style={{display:"flex",gap:24,flexWrap:"wrap"}}>
-            {[{l:"YTD Revenue",v:fmt(m.YTD_rev,cur)},{l:"LTM Revenue",v:fmt(m.LTM_rev,cur)},{l:"CAGR",v:fmtPct(m.CAGR_rev),c:clrP(m.CAGR_rev)},{l:th?"ยอดกู้":"Loan",v:fmt(m.loanBal,cur)}].map((s,i)=>(
+            {[{l:"CFO",v:fmt(m.operatingCashFlow,cur),c:m.operatingCashFlow>=0?"#1FD9A4":"#F7637C"},{l:"CFI",v:fmt(m.investingCashFlow,cur),c:"#F7B84F"},{l:"CFF",v:fmt(m.financingCashFlow,cur),c:"#A78BFA"},{l:"CAGR",v:fmtPct(m.CAGR_rev),c:clrP(m.CAGR_rev)}].map((s,i)=>(
               <div key={i}><div style={{fontSize:10,color:SM}}>{s.l}</div><div style={{fontSize:15,fontWeight:800,color:s.c||ST}}>{s.v}</div></div>
             ))}
           </div>
@@ -1079,21 +1149,21 @@ function SlideViewer({store, companyId, year, lang}) {
     );
     if (slide.type==="momentum") return (
       <div style={{...sbase,padding:32}}>
-        <div style={{position:"absolute",top:0,left:0,right:0,height:3,background:"linear-gradient(90deg,#A78BFA,#F7B84F)"}}/>
+        <div style={{position:"absolute",top:0,left:0,right:0,height:3,background:"linear-gradient(90deg,#A78BFA,#38BDF8,#F7B84F)"}}/>
         <div style={{fontSize:11,color:"#A78BFA",letterSpacing:"0.15em",textTransform:"uppercase",marginBottom:8}}>MOMENTUM & TREND</div>
         <div style={{fontSize:21,fontWeight:800,color:"#fff",marginBottom:18}}>{th?"วิเคราะห์โมเมนตัม":"Momentum Dashboard"}</div>
         <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:12}}>
-          {[{id:"MOM",d:th?"เทียบเดือน":"vs Month",v:m.MOM_rev,f:"(M₁-M₀)/|M₀|",c:"#5B7CFA"},{id:"QOQ",d:th?"เทียบไตรมาส":"vs Qtr",v:m.QOQ_rev,f:"(Q₁-Q₀)/|Q₀|",c:"#5B7CFA"},{id:"YOY",d:th?"เทียบปี":"vs Year",v:m.YOY_rev,f:"(Y₁-Y₀)/|Y₀|",c:"#1FD9A4"},{id:"CAGR",d:th?"เติบโตเฉลี่ย":"Growth",v:m.CAGR_rev,f:"(E/S)^⅟ₙ-1",c:"#A78BFA"}].map((k,i)=>(
+          {[{id:"YOY",d:th?"เทียบปี":"vs Year",v:m.YOY_rev,f:"(Y₁-Y₀)/|Y₀|",c:"#1FD9A4"},{id:"MARGIN",d:th?"กำไรสุทธิ":"Net Margin",v:m.margin,f:"NP / Revenue",c:"#38BDF8"},{id:"CAGR",d:th?"เติบโตเฉลี่ย":"Growth",v:m.CAGR_rev,f:"(E/S)^⅟ₙ-1",c:"#A78BFA"},{id:"D/E",d:th?"หนี้สินต่อทุน":"Debt/Equity",v:debtToEquity,c:"#F7637C",suffix:"x",f:"Debt / Equity"}].map((k,i)=>(
             <div key={i} style={{background:"#ffffff06",border:`1px solid ${k.c}40`,borderRadius:10,padding:14,textAlign:"center"}}>
               <div style={{fontSize:11,fontWeight:800,color:k.c,marginBottom:2}}>{k.id}</div>
               <div style={{fontSize:10,color:SM,marginBottom:10}}>{k.d}</div>
-              <div style={{fontSize:23,fontWeight:800,color:clrP(k.v),marginBottom:6}}>{fmtPct(k.v)}</div>
+              <div style={{fontSize:23,fontWeight:800,color:i===3?ST:clrP(k.v),marginBottom:6}}>{i===3?(k.v==null?"N/A":`${k.v.toFixed(2)}${k.suffix}`):fmtPct(k.v)}</div>
               <div style={{fontSize:9,color:SM,fontFamily:"monospace"}}>{k.f}</div>
             </div>
           ))}
         </div>
         <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10}}>
-          {[{id:"MTD",d:th?"สะสมเดือน":"Month",v:m.revenue,c:"#1FD9A4"},{id:"YTD",d:th?"สะสมปี":"Year",v:m.YTD_rev,c:"#1FD9A4"},{id:"LTM",d:th?"12 เดือน":"Rolling",v:m.LTM_rev,c:"#A78BFA"}].map((k,i)=>(
+          {[{id:"Revenue",d:th?"รายได้":"Revenue",v:m.revenue,c:"#1FD9A4"},{id:"Assets",d:th?"สินทรัพย์":"Assets",v:m.asset,c:"#38BDF8"},{id:"Equity",d:th?"ส่วนทุน":"Equity",v:m.equity,c:"#A78BFA"}].map((k,i)=>(
             <div key={i} style={{background:"#ffffff06",border:`1px solid ${k.c}40`,borderRadius:10,padding:12,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
               <div><div style={{fontSize:11,fontWeight:800,color:k.c}}>{k.id}</div><div style={{fontSize:10,color:SM}}>{k.d}</div></div>
               <div style={{fontSize:15,fontWeight:800,color:ST}}>{fmt(k.v,cur)}</div>
@@ -1104,50 +1174,174 @@ function SlideViewer({store, companyId, year, lang}) {
     );
     return (
       <div style={{...sbase,padding:32}}>
-        <div style={{position:"absolute",top:0,left:0,right:0,height:3,background:"linear-gradient(90deg,#1FD9A4,#5B7CFA)"}}/>
-        <div style={{fontSize:11,color:"#1FD9A4",letterSpacing:"0.15em",textTransform:"uppercase",marginBottom:8}}>CASHFLOW</div>
-        <div style={{fontSize:21,fontWeight:800,color:"#fff",marginBottom:18}}>{th?"กระแสเงินสดรายเดือน":"Monthly Cashflow"}</div>
+        <div style={{position:"absolute",top:0,left:0,right:0,height:3,background:"linear-gradient(90deg,#1FD9A4,#38BDF8,#A78BFA)"}}/>
+        <div style={{fontSize:11,color:"#1FD9A4",letterSpacing:"0.15em",textTransform:"uppercase",marginBottom:8}}>CASHFLOW QUALITY</div>
+        <div style={{fontSize:21,fontWeight:800,color:"#fff",marginBottom:18}}>{th?"คุณภาพกระแสเงินสด":"Cash Flow Quality"} · {periodLabel}</div>
         <ResponsiveContainer width="100%" height={250}>
-          <BarChart data={data.map(d=>({month:th?d.monthTh:d.monthEn,cashIn:d.cashIn,cashOut:d.cashOut}))} barCategoryGap="30%">
+          <BarChart data={[{name:"CFO",value:m.operatingCashFlow,color:"#1FD9A4"},{name:"CFI",value:m.investingCashFlow,color:"#F7B84F"},{name:"CFF",value:m.financingCashFlow,color:"#A78BFA"}]} barCategoryGap="40%">
             <CartesianGrid strokeDasharray="3 3" stroke={SB} vertical={false}/>
-            <XAxis dataKey="month" tick={{fontSize:10,fill:SM}} axisLine={false} tickLine={false}/>
-            <YAxis tick={{fontSize:10,fill:SM}} axisLine={false} tickLine={false} tickFormatter={v=>`${(v/1e3).toFixed(0)}K`}/>
-            <Tooltip content={<Tip currency={cur}/>}/>
-            <Bar dataKey="cashIn" name={th?"รายรับ":"In"} fill="#1FD9A4" radius={[3,3,0,0]}/>
-            <Bar dataKey="cashOut" name={th?"รายจ่าย":"Out"} fill="#F7637C" radius={[3,3,0,0]}/>
+            <XAxis dataKey="name" tick={{fontSize:11,fill:SM}} axisLine={false} tickLine={false}/>
+            <YAxis tick={{fontSize:10,fill:SM}} axisLine={false} tickLine={false} tickFormatter={v=>`${(v/1e6).toFixed(0)}M`}/>
+            <Tooltip content={({active,payload})=>active&&payload?.length?(<div style={{background:SD,border:`1px solid ${SB}`,borderRadius:8,padding:"8px 12px",fontSize:13,color:ST}}>{payload[0].payload.name}: <b>{fmt(payload[0].value,cur)}</b></div>):null}/>
+            <ReferenceLine y={0} stroke={SB}/>
+            <Bar dataKey="value" name={th?"กระแสเงินสด":"Cash Flow"} radius={[5,5,0,0]}>{["#1FD9A4","#F7B84F","#A78BFA"].map((color,i)=><Cell key={i} fill={color}/>)}</Bar>
           </BarChart>
         </ResponsiveContainer>
       </div>
     );
   };
 
+  const InsightCard = ({title, value, note, color}) => (
+    <div style={{padding:14,border:`1px solid ${color || C.border}40`,background:(color || C.accent)+"12",borderRadius:12}}>
+      <div style={{fontSize:11,color:C.muted,fontWeight:800,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:5}}>{title}</div>
+      <div style={{fontSize:20,fontWeight:900,color:color || C.text,marginBottom:4}}>{value}</div>
+      <div style={{fontSize:12,color:C.muted,lineHeight:1.45}}>{note}</div>
+    </div>
+  );
+
+  if (!hasData) {
+    return (
+      <div>
+        <PageHeader title={th?"Slide Workspace":"Slide Workspace"} subtitle={th?"อัปโหลดหรือนำเข้าข้อมูลก่อนสร้างสไลด์":"Upload or select imported data before generating slides"}/>
+        <div style={{display:"grid",gridTemplateColumns:"minmax(280px,0.95fr) minmax(360px,1.35fr)",gap:16}}>
+          <Card>
+            <SegmentedToggle value={sourceMode} onChange={setSourceMode} options={[{value:"upload",icon:"⬆",label:th?"อัปโหลด":"Upload"},{value:"official",icon:"🏛",label:th?"ทางการ":"Official"},{value:"saved",icon:"🗂",label:th?"ที่บันทึก":"Saved"}]} style={{width:"100%",justifyContent:"center",marginBottom:14}} compact/>
+            <button onClick={onGoUpload} style={{width:"100%",padding:"18px",borderRadius:12,border:`2px dashed ${C.border}`,background:C.surface,color:C.text,cursor:"pointer",fontWeight:850}}>
+              ⬆ {th?"ไปหน้าอัปโหลดข้อมูล":"Go to Upload Data"}
+            </button>
+          </Card>
+          <Card style={{textAlign:"center",padding:42}}>
+            <div style={{fontSize:34,marginBottom:12}}>🖥</div>
+            <div style={{fontSize:18,fontWeight:800,color:C.text,marginBottom:6}}>{th?"ยังไม่มีข้อมูลสำหรับสร้างสไลด์":"No data to generate slides"}</div>
+            <div style={{fontSize:14,color:C.muted}}>{th?"เลือกไฟล์งบจากฝั่งซ้าย หรือใช้ข้อมูลที่เคย Import แล้ว":"Use the left source panel to import or select saved data."}</div>
+          </Card>
+        </div>
+      </div>
+    );
+  }
+
+  const sourcePanel = (
+    <Card style={{padding:0,overflow:"hidden"}}>
+      <div style={{padding:16,borderBottom:`1px solid ${C.border}`}}>
+        <div style={{fontSize:13,fontWeight:900,color:C.muted,letterSpacing:"0.06em",textTransform:"uppercase",marginBottom:10}}>{th?"แหล่งข้อมูล":"Data Source"}</div>
+        <SegmentedToggle value={sourceMode} onChange={setSourceMode} options={[{value:"upload",icon:"⬆",label:th?"อัปโหลด":"Upload"},{value:"official",icon:"🏛",label:th?"ทางการ":"Official"},{value:"saved",icon:"🗂",label:th?"ที่บันทึก":"Saved"}]} style={{width:"100%",justifyContent:"center"}} compact/>
+      </div>
+      <div style={{padding:16}}>
+        {sourceMode === "upload" && (onImportSuccess ? (
+          <div style={{maxHeight:540,overflowY:"auto",paddingRight:4}}>
+            <ImportWizard companyId={companyId} company={company} onImportSuccess={onImportSuccess} lang={lang} theme={theme} C={C}/>
+          </div>
+        ) : (
+          <button onClick={onGoUpload} style={{width:"100%",padding:24,borderRadius:12,border:`2px dashed ${C.border}`,background:C.surface,color:C.text,cursor:"pointer",fontWeight:850}}>⬆ {th?"ไปหน้าอัปโหลดข้อมูล":"Go to Upload Data"}</button>
+        ))}
+        {sourceMode === "official" && (
+          <div style={{display:"grid",gap:12}}>
+            <div style={{padding:16,borderRadius:12,background:C.accentLo,border:`1px solid ${C.accent}35`}}>
+              <div style={{fontSize:22,marginBottom:8}}>🏛</div>
+              <div style={{fontWeight:900,color:C.text,marginBottom:6}}>{th?"Official Data Connector":"Official Data Connector"}</div>
+              <div style={{fontSize:13,color:C.muted,lineHeight:1.6}}>{th?"โครงสร้างนี้เตรียมไว้สำหรับ SET/DBD/API ทางการในอนาคต โดยไม่ใช้การ scrape เว็บเป็นฐานหลัก":"Prepared for official SET/DBD/API sources. Web scraping is intentionally not used as the main production source."}</div>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+              <div style={{padding:12,borderRadius:10,border:`1px solid ${C.border}`}}><div style={{fontSize:11,color:C.muted,fontWeight:800}}>Ticker</div><div style={{fontWeight:900,color:C.text}}>{ticker}</div></div>
+              <div style={{padding:12,borderRadius:10,border:`1px solid ${C.border}`}}><div style={{fontSize:11,color:C.muted,fontWeight:800}}>Period</div><div style={{fontWeight:900,color:C.text}}>{periodLabel}</div></div>
+            </div>
+            <button disabled style={{padding:"11px 14px",borderRadius:10,border:`1px solid ${C.border}`,background:C.surface,color:C.muted,fontWeight:800,cursor:"not-allowed"}}>{th?"รอเชื่อม API ทางการ":"Official API pending"}</button>
+          </div>
+        )}
+        {sourceMode === "saved" && (
+          <div style={{display:"grid",gap:8}}>
+            <div style={{fontSize:13,color:C.muted,lineHeight:1.6}}>{th?"ข้อมูลที่เคย import แล้วของบริษัทนี้":"Saved imports available for this company."}</div>
+            {annualRows.length ? annualRows.map(row => (
+              <div key={row.year} style={{padding:12,borderRadius:10,border:`1px solid ${Number(row.year)===Number(displayYear)?C.accent:C.border}`,background:Number(row.year)===Number(displayYear)?C.accentLo:C.surface}}>
+                <div style={{fontWeight:900,color:C.text}}>FY {row.year}</div>
+                <div style={{fontSize:12,color:C.muted,marginTop:4}}>{th?"รายได้":"Revenue"}: {fmt(row.revenue,cur)} · {th?"กำไร":"Profit"}: {fmt(row.netProfit,cur)}</div>
+              </div>
+            )) : <div style={{padding:14,borderRadius:10,border:`1px solid ${C.border}`,color:C.muted}}>{th?"ยังไม่มี import history":"No saved import history"}</div>}
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+
+  const presentationPanel = (
+    <Card style={{height:"100%"}}>
+      <div style={{display:"flex",justifyContent:"space-between",gap:12,alignItems:"flex-start",marginBottom:16}}>
+        <div>
+          <div style={{fontSize:13,fontWeight:900,color:C.muted,textTransform:"uppercase",letterSpacing:"0.06em"}}>{th?"พื้นที่นำเสนอ":"Presentation Side"}</div>
+          <div style={{fontSize:19,fontWeight:950,color:C.text,marginTop:4}}>{th?company.nameTh:company.nameEn}</div>
+          <div style={{fontSize:13,color:C.muted,marginTop:3}}>{periodLabel} · {company.currency}</div>
+        </div>
+        <button onClick={handleExport} disabled={exporting} style={{padding:"10px 16px",borderRadius:999,background:C.accent,color:"#fff",border:"none",fontSize:13,fontWeight:850,cursor:exporting?"wait":"pointer",opacity:exporting?0.65:1}}>⬇ {exporting?(th?"กำลังสร้าง":"Generating"):(th?"Export PPTX":"Export PPTX")}</button>
+      </div>
+      {exportError&&<div style={{fontSize:12,color:C.red,marginBottom:10}}>{exportError}</div>}
+      <div className="responsive-grid-4" style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:14}}>
+        <InsightCard title={th?"รายได้":"Revenue"} value={fmt(m.revenue,cur)} note={`YoY ${fmtPct(m.YOY_rev)}`} color={C.green}/>
+        <InsightCard title={th?"กำไรสุทธิ":"Net Profit"} value={fmt(m.netProfit,cur)} note={`Margin ${m.margin.toFixed(1)}%`} color={m.netProfit>=0?C.accent:C.red}/>
+        <InsightCard title={th?"สินทรัพย์":"Assets"} value={fmt(m.asset,cur)} note={th?"สีฟ้าตามระบบใหม่":"Asset blue mapping"} color={C.blue}/>
+        <InsightCard title="CFO" value={fmt(m.operatingCashFlow,cur)} note={`Cash quality ${cashQuality==null?"N/A":cashQuality.toFixed(2)+"x"}`} color={m.operatingCashFlow>=0?C.green:C.red}/>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
+        <div style={{padding:14,borderRadius:12,border:`1px solid ${C.border}`,background:C.surface}}>
+          <div style={{fontSize:12,fontWeight:900,color:C.muted,marginBottom:8}}>{th?"Key Insights":"Key Insights"}</div>
+          <div style={{display:"grid",gap:7,fontSize:13,color:C.text,lineHeight:1.55}}>
+            <div>• {th?"การเติบโต YoY":"YoY growth"}: <b style={{color:clrP(m.YOY_rev)}}>{fmtPct(m.YOY_rev)}</b></div>
+            <div>• {th?"หนี้สินต่อทุน":"Debt to Equity"}: <b>{debtToEquity==null?"N/A":`${debtToEquity.toFixed(2)}x`}</b></div>
+            <div>• {th?"สมการงบฐานะ":"Balance equation gap"}: <b style={{color:(balanceGapPct || 0) < 1 ? C.green : C.amber}}>{balanceGapPct==null?"N/A":`${balanceGapPct.toFixed(2)}%`}</b></div>
+          </div>
+        </div>
+        <div style={{padding:14,borderRadius:12,border:`1px solid ${C.border}`,background:C.surface}}>
+          <div style={{fontSize:12,fontWeight:900,color:C.muted,marginBottom:8}}>{th?"Slide Outline":"Slide Outline"}</div>
+          <div style={{display:"grid",gap:7}}>
+            {SLIDES.map(item=>(
+              <button key={item.id} onClick={()=>{setActiveSlide(item.id);setWorkspaceMode("presentation");}} style={{textAlign:"left",padding:"8px 10px",borderRadius:9,border:`1px solid ${activeSlide===item.id?C.accent:C.border}`,background:activeSlide===item.id?C.accentLo:"transparent",color:activeSlide===item.id?C.accent:C.text,cursor:"pointer",fontWeight:800}}>{item.id}. {th?item.th:item.en}</button>
+            ))}
+          </div>
+        </div>
+      </div>
+      <div style={{marginTop:10}}>{renderSlide()}</div>
+    </Card>
+  );
+
   return (
     <div>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:24,flexWrap:"wrap",gap:12}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,flexWrap:"wrap",gap:12}}>
         <div>
-          <div style={{fontSize:28,fontWeight:800,color:C.white,marginBottom:6}}>Slide Master Template</div>
-          <div style={{fontSize:15,color:C.muted,fontWeight:500}}>{th?"เทมเพลตนำเสนอ — ข้อมูลผูกสูตรจริงจากบริษัทที่เลือก":"Presentation template — bound to selected company"}</div>
+          <div style={{fontSize:28,fontWeight:900,color:C.text,marginBottom:6}}>{th?"Slide Workspace":"Slide Workspace"}</div>
+          <div style={{fontSize:15,color:C.muted,fontWeight:500}}>{th?"ซ้ายคือแหล่งข้อมูล ขวาคือพื้นที่นำเสนอและสไลด์พรีวิว":"Left side is the data source; right side is the presentation workspace."}</div>
         </div>
-        <div>
-          <button onClick={handleExport} disabled={exporting} style={{padding:"10px 20px",borderRadius:8,background:C.accent,color:"#fff",border:"none",fontSize:14,fontWeight:700,cursor:exporting?"wait":"pointer",opacity:exporting?0.65:1}}>⬇ {exporting?(th?"กำลังสร้าง...":"Generating..."):(th?"ส่งออก PPTX":"Export PPTX")}</button>
-          {exportError&&<div style={{fontSize:12,color:C.red,marginTop:6}}>{exportError}</div>}
-        </div>
+        <SegmentedToggle value={workspaceMode} onChange={setWorkspaceMode} options={[{value:"input",icon:"⬆",label:th?"ข้อมูลนำเข้า":"Data Input"},{value:"presentation",icon:"🖥",label:th?"นำเสนอ":"Presentation"}]}/>
       </div>
-      <div style={{display:"flex",gap:8,marginBottom:16,overflowX:"auto",paddingBottom:4}}>
-        {SLIDES.map(s=>(
-          <div key={s.id} onClick={()=>setActiveSlide(s.id)} style={{flexShrink:0,width:130,cursor:"pointer",border:`2px solid ${activeSlide===s.id?C.accent:C.border}`,borderRadius:8,overflow:"hidden"}}>
-            <div style={{background:SD,aspectRatio:"16/9",display:"flex",flexDirection:"column",justifyContent:"center",alignItems:"center",padding:8}}>
-              <div style={{fontSize:8,color:"#5B7CFA",letterSpacing:"0.1em",marginBottom:4}}>SLIDE {s.id}</div>
-              <div style={{fontSize:10,color:ST,textAlign:"center",fontWeight:700}}>{th?s.th:s.en}</div>
+
+      {workspaceMode === "input" ? (
+        <div style={{display:"grid",gridTemplateColumns:"minmax(330px,0.95fr) minmax(520px,1.45fr)",gap:16,alignItems:"start"}}>
+          {sourcePanel}
+          {presentationPanel}
+        </div>
+      ) : (
+        <div style={{display:"grid",gridTemplateColumns:"300px minmax(520px,1fr)",gap:16,alignItems:"start"}}>
+          <Card>
+            <div style={{fontSize:13,fontWeight:900,color:C.muted,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:12}}>{th?"ชุดสไลด์":"Slide Deck"}</div>
+            <div style={{display:"grid",gap:10}}>
+              {SLIDES.map(item=>(
+                <div key={item.id} onClick={()=>setActiveSlide(item.id)} style={{cursor:"pointer",border:`2px solid ${activeSlide===item.id?C.accent:C.border}`,borderRadius:12,overflow:"hidden",background:activeSlide===item.id?C.accentLo:C.surface}}>
+                  <div style={{background:SD,aspectRatio:"16/9",display:"flex",flexDirection:"column",justifyContent:"center",alignItems:"center",padding:10}}>
+                    <div style={{fontSize:8,color:"#38BDF8",letterSpacing:"0.1em",marginBottom:5}}>SLIDE {item.id}</div>
+                    <div style={{fontSize:11,color:ST,textAlign:"center",fontWeight:800}}>{th?item.th:item.en}</div>
+                  </div>
+                  <div style={{padding:10,fontSize:12,color:C.muted,lineHeight:1.45}}>{th?item.descTh:item.descEn}</div>
+                </div>
+              ))}
             </div>
+          </Card>
+          <div>
+            {presentationPanel}
+            <Card style={{marginTop:12}}>
+              <div style={{fontSize:12,color:C.muted,fontWeight:800,marginBottom:6}}>{th?"หมายเหตุสไลด์":"Slide Notes"}</div>
+              <div style={{fontSize:13,color:C.text,lineHeight:1.7}}>{th?`สร้างจากข้อมูลจริงของ ${company.nameTh} ${periodLabel} — สีกราฟใช้ตามมาตรฐานใหม่ โดยสินทรัพย์เป็นสีฟ้าและไม่ใช้แท่งสีดำเป็นตัวนำ`:`Generated from live data of ${company.nameEn} ${periodLabel}. Chart colors follow the new standard: assets are blue and black is not used as a primary data bar.`}</div>
+            </Card>
           </div>
-        ))}
-      </div>
-      {renderSlide()}
-      <Card style={{marginTop:12}}>
-        <div style={{fontSize:12,color:C.muted,fontWeight:700,marginBottom:6}}>{th?"หมายเหตุสไลด์":"Slide Notes"}</div>
-        <div style={{fontSize:13,color:C.text,lineHeight:1.7}}>{th?`สร้างจากข้อมูลจริงของ ${company.nameTh} ปี ${year} — ทุกตัวเลขผูกสูตรพิสูจน์ได้ อัปเดตอัตโนมัติเมื่ออัปโหลดข้อมูลใหม่`:`Generated from live data of ${company.nameEn} ${year} — formula-verified, auto-updates.`}</div>
-      </Card>
+        </div>
+      )}
     </div>
   );
 }
@@ -1564,7 +1758,7 @@ export default function App() {
     if (page==="compare") return <ComparePage store={store} companyIds={compareIds} year={year} lang={lang} onBack={()=>setPage("companies")}/>;
     if (page==="industry") return <IndustryPage store={store} year={year} lang={lang}/>;
     if (page==="consolidation") return <ConsolidationPage store={store} year={year} lang={lang} exchangeRates={exchangeRates} onSaveRate={handleSaveRate}/>;
-    if (page==="slides") return <SlideViewer store={store} companyId={companyId} year={year} lang={lang}/>;
+    if (page==="slides") return <SlideViewer store={store} companyId={companyId} year={year} lang={lang} theme={theme} onImportSuccess={handleUpsert} onGoUpload={()=>setPage("upload")}/>;
     if (page==="access") return <AccessPage companyId={companyId} lang={lang}/>;
     if (page==="audit") return <AuditPage lang={lang}/>;
     if (page==="backup") return <BackupPage companies={companies} store={store} exchangeRates={exchangeRates} onImport={handleBackupImport} lang={lang}/>;
@@ -1628,13 +1822,13 @@ export default function App() {
 
         <div className="app-sidebar-controls" style={{padding:"14px 14px",borderTop:`1px solid ${C.border}`}}>
           {/* Theme toggle */}
-          <div style={{display:"flex",gap:6,marginBottom:12}}>
-            {[{k:"dark",ic:"🌙",l:th?"มืด":"Dark"},{k:"light",ic:"☀️",l:th?"สว่าง":"Light"}].map(t=>(
-              <button key={t.k} onClick={()=>setTheme(t.k)} style={{flex:1,padding:"8px",borderRadius:8,border:`1px solid ${theme===t.k?C.accent:C.border}`,fontSize:12,fontWeight:700,cursor:"pointer",background:theme===t.k?C.accentLo:"transparent",color:theme===t.k?C.accent:C.muted}}>
-                {t.ic} {t.l}
-              </button>
-            ))}
-          </div>
+          <SegmentedToggle
+            value={theme}
+            onChange={setTheme}
+            compact
+            style={{width:"100%",justifyContent:"center",marginBottom:12}}
+            options={[{value:"dark",icon:"🌙",label:th?"มืด":"Dark"},{value:"light",icon:"☀️",label:th?"สว่าง":"Light"}]}
+          />
           <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:6,fontWeight:700}}>{th?"บริษัท":"Company"}</div>
           <select value={companyId} onChange={e=>setCompanyId(Number(e.target.value))} style={{...selStyle,marginBottom:8}}>
             {COMPANIES.map(c=>(<option key={c.id} value={c.id}>{th?c.nameTh:c.nameEn}</option>))}
@@ -1642,11 +1836,13 @@ export default function App() {
           <select value={year} onChange={e=>setYear(Number(e.target.value))} style={selStyle}>
             {[2023,2024,2025,2026].map(y=>(<option key={y} value={y}>{y} (พ.ศ.{y+543})</option>))}
           </select>
-          <div style={{display:"flex",gap:5,marginTop:10}}>
-            {["th","en"].map(l=>(
-              <button key={l} onClick={()=>setLang(l)} style={{flex:1,padding:"6px",borderRadius:7,border:"none",fontSize:12,fontWeight:700,cursor:"pointer",background:lang===l?C.accent:C.border,color:lang===l?"#fff":C.muted}}>{l.toUpperCase()}</button>
-            ))}
-          </div>
+          <SegmentedToggle
+            value={lang}
+            onChange={setLang}
+            compact
+            style={{width:"100%",justifyContent:"center",marginTop:10}}
+            options={[{value:"th",label:"TH"},{value:"en",label:"EN"}]}
+          />
         </div>
       </div>
 
