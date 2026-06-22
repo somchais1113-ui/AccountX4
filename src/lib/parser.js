@@ -233,14 +233,34 @@ function cleanAccountLabel(value) {
 }
 
 function workbookIndustryProfile(fileName = '', sheetName = '', rows = []) {
-  const sample = `${fileName} ${sheetName} ${rows.slice(0, 25).map(rowToText).join(' ')}`;
+  // Detect industry from the financial-statement CONTENT (account-line signals), not from a
+  // hardcoded company name. Company/ticker keywords are kept only as a weak tie-breaker so
+  // existing master fixtures still resolve, but any new company is classified by its lines.
+  const sample = `${fileName} ${sheetName} ${rows.slice(0, 60).map(rowToText).join(' ')}`;
   const t = normalizeForMatch(sample);
-  if (t.includes('banking') || t.includes('kbank') || t.includes('ธนาคาร') || t.includes('เงินรับฝาก') || t.includes('เงินให้สินเชื่อ')) return 'banking';
-  if (t.includes('hospital') || t.includes('bdms') || t.includes('โรงพยาบาล') || t.includes('ค่ารักษาพยาบาล')) return 'healthcare';
-  if (t.includes('realestate') || t.includes('spali') || t.includes('อสังหาริมทรัพย์') || t.includes('พัฒนาโครงการ')) return 'real_estate';
-  if (t.includes('manufacturing') || t.includes('cpf') || t.includes('เจริญโภคภัณฑ์อาหาร') || t.includes('สินทรัพย์ชีวภาพ')) return 'manufacturing';
-  if (t.includes('retail') || t.includes('moshi') || t.includes('โมชิโมชิ')) return 'retail';
-  return 'general';
+  const count = (keywords) => keywords.reduce((acc, kw) => acc + (t.includes(normalizeForMatch(kw)) ? 1 : 0), 0);
+
+  // Strong, statement-content signals per industry.
+  const scores = {
+    banking: count(['เงินรับฝาก', 'เงินให้สินเชื่อ', 'รายได้ดอกเบี้ยสุทธิ', 'รายการระหว่างธนาคารและตลาดเงิน', 'ผลขาดทุนด้านเครดิตที่คาดว่าจะเกิดขึ้น', 'ตราสารหนี้ที่ออกและเงินกู้ยืม']) * 2,
+    healthcare: count(['รายได้ค่ารักษาพยาบาล', 'ต้นทุนค่ารักษาพยาบาล', 'โรงพยาบาล']) * 2,
+    real_estate: count(['ต้นทุนการพัฒนาอสังหาริมทรัพย์', 'รายได้จากการขายอสังหาริมทรัพย์', 'เงินมัดจำค่าซื้อที่ดิน', 'ต้นทุนในการได้มาซึ่งสัญญา', 'อสังหาริมทรัพย์เพื่อการลงทุน']) * 2,
+    manufacturing: count(['สินทรัพย์ชีวภาพ', 'รายได้จากการจำหน่ายสินค้า', 'สินค้าระหว่างผลิต', 'วัตถุดิบ']) * 2,
+    retail: count(['รายได้จากการขายและการให้บริการ', 'สินค้าคงเหลือ', 'รายได้จากการขายสินค้า']),
+  };
+
+  // Weak tie-breaker from file/company naming, lower weight than content.
+  if (t.includes('kbank') || t.includes('ธนาคาร')) scores.banking += 1;
+  if (t.includes('bdms')) scores.healthcare += 1;
+  if (t.includes('spali')) scores.real_estate += 1;
+  if (t.includes('cpf') || t.includes('เจริญโภคภัณฑ์อาหาร')) scores.manufacturing += 1;
+  if (t.includes('moshi') || t.includes('โมชิ')) scores.retail += 1;
+
+  let best = 'general', bestScore = 0;
+  for (const [profile, score] of Object.entries(scores)) {
+    if (score > bestScore) { best = profile; bestScore = score; }
+  }
+  return bestScore >= 2 ? best : 'general';
 }
 
 function shouldIgnoreSheet(sheetName, workbookSheetNames = []) {
@@ -806,8 +826,10 @@ function promoteRevenueFallback(rows) {
       candidates[0].mapping_source = candidates[0].mapping_source || 'parser_rule';
       candidates[0].suggested_account_group = candidates[0].account_group;
       candidates[0].suggested_account_subgroup = candidates[0].account_subgroup;
-      candidates[0].review_reason = null;
-      candidates[0].needs_review = false;
+      // This is an inferred promotion, not a confirmed mapping. Keep it flagged for review
+      // so a wrong guess never silently lands in the dashboard/export as confirmed revenue.
+      candidates[0].review_reason = 'Revenue total was inferred from a single detail line; please confirm.';
+      candidates[0].needs_review = true;
     }
   });
 }
@@ -833,10 +855,15 @@ function detectWorkbookContext(rows, sheetName) {
 }
 
 function normalizeAmountForDashboard(value, group, statementType) {
+  // Expenses are stored as positive magnitudes for dashboard aggregation. Some statements
+  // present them as negatives, some as positives. We normalize to positive, but we report
+  // whether a sign flip actually happened so the row can be flagged for review instead of
+  // silently changing a figure's sign.
   if (statementType === 'income_statement' && ['cogs', 'sga', 'expense', 'finance_cost', 'tax'].includes(group)) {
-    return Math.abs(value);
+    const normalized = Math.abs(value);
+    return { amount: normalized, signFlipped: value < 0 };
   }
-  return value;
+  return { amount: value, signFlipped: false };
 }
 
 function parseStandardStatementSheet(rows, sheetName, companyId, fileName) {
@@ -903,7 +930,11 @@ function parseStandardStatementSheet(rows, sheetName, companyId, fileName) {
 
     amounts.forEach(({ colIdx, year, period_type, scope, value, raw }) => {
       const rawNormalizedAmount = value * unitInfo.multiplier;
-      const amount = normalizeAmountForDashboard(rawNormalizedAmount, mapping.group, currentStatementType);
+      const { amount, signFlipped } = normalizeAmountForDashboard(rawNormalizedAmount, mapping.group, currentStatementType);
+      const needsReview = shouldReviewMapping(mapping) || signFlipped;
+      const reviewReason = signFlipped
+        ? (reviewReasonForMapping(mapping) || 'Expense sign was normalized to positive; please confirm the original sign.')
+        : reviewReasonForMapping(mapping);
       parsedRows.push({
         id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `${sheetName}-${rowIdx + 1}-${colIdx}-${year}`,
         company_id: companyId,
@@ -937,8 +968,8 @@ function parseStandardStatementSheet(rows, sheetName, companyId, fileName) {
         mapping_source: mapping.mapping_source || 'parser_rule',
         suggested_account_group: mapping.group,
         suggested_account_subgroup: mapping.subgroup || detectSubgroupFromText(sectionText),
-        review_reason: reviewReasonForMapping(mapping),
-        needs_review: shouldReviewMapping(mapping),
+        review_reason: reviewReason,
+        needs_review: needsReview,
       });
     });
   }
@@ -1010,6 +1041,47 @@ function parseEquityStatementSheet(rows, sheetName, companyId, fileName) {
   return parsedRows;
 }
 
+// Post-parse integrity validation. Cross-checks the parsed totals per fiscal year/scope so
+// a row eaten or mis-mapped by the parser surfaces as a warning instead of a silent error.
+function validateParsedIntegrity(rows) {
+  const byKey = new Map();
+  rows.forEach((row) => {
+    if (!Number.isFinite(row.fiscal_year)) return;
+    const key = `${row.fiscal_year}|${row.period || 'FY'}|${row.period_type || 'annual'}|${row.statement_scope || 'consolidated'}`;
+    if (!byKey.has(key)) byKey.set(key, {});
+    const acc = byKey.get(key);
+    const g = row.account_group;
+    if (g === 'asset') acc.asset = (acc.asset || 0) + row.amount;
+    else if (g === 'liability') acc.liability = (acc.liability || 0) + row.amount;
+    else if (g === 'equity') acc.equity = (acc.equity || 0) + row.amount;
+    else if (g === 'total_current_assets') acc.currentAssets = (acc.currentAssets || 0) + row.amount;
+    else if (g === 'total_non_current_assets') acc.nonCurrentAssets = (acc.nonCurrentAssets || 0) + row.amount;
+    else if (g === 'revenue') acc.revenue = (acc.revenue || 0) + row.amount;
+  });
+
+  const issues = [];
+  const tol = (a, b) => Math.max(Math.abs(a), Math.abs(b)) * 0.01 + 1;
+  for (const [key, acc] of byKey.entries()) {
+    const [year, period, periodType, scope] = key.split('|');
+    if ((acc.asset || acc.liability || acc.equity)) {
+      const diff = (acc.asset || 0) - ((acc.liability || 0) + (acc.equity || 0));
+      if (Math.abs(diff) > tol(acc.asset || 0, (acc.liability || 0) + (acc.equity || 0))) {
+        issues.push({ year: Number(year), period, periodType, scope, check: 'balance_sheet', difference: diff, message: 'Assets do not equal Liabilities + Equity.' });
+      }
+    }
+    if (acc.currentAssets && acc.nonCurrentAssets && acc.asset) {
+      const diff = (acc.currentAssets + acc.nonCurrentAssets) - acc.asset;
+      if (Math.abs(diff) > tol(acc.currentAssets + acc.nonCurrentAssets, acc.asset)) {
+        issues.push({ year: Number(year), period, periodType, scope, check: 'current_assets_subtotal', difference: diff, message: 'Current + Non-current assets do not equal Total assets.' });
+      }
+    }
+    if (acc.revenue !== undefined && acc.revenue < 0) {
+      issues.push({ year: Number(year), period, periodType, scope, check: 'revenue_sign', difference: acc.revenue, message: 'Total revenue is negative.' });
+    }
+  }
+  return { passed: issues.length === 0, issues };
+}
+
 function makeSummary(rows, workbook, fileName) {
   const sheets = [...new Set(rows.map((row) => row.source_sheet))];
   const years = [...new Set(rows.map((row) => row.fiscal_year))].filter(Boolean).sort((a, b) => b - a);
@@ -1017,6 +1089,7 @@ function makeSummary(rows, workbook, fileName) {
   const companyNames = [...new Set(rows.map((row) => normalizeText(row.company_name)).filter(Boolean))].slice(0, 6);
   const mappedCount = rows.filter((row) => !row.needs_review).length;
   const reviewCount = rows.length - mappedCount;
+  const integrity = validateParsedIntegrity(rows);
   return {
     fileName,
     parserVersion: 'IMPORT_PARSER_V3_INDUSTRY_PACK_V1',
@@ -1028,6 +1101,7 @@ function makeSummary(rows, workbook, fileName) {
     rows: rows.length,
     mappedCount,
     reviewCount,
+    integrity,
   };
 }
 

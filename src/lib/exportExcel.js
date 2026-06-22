@@ -8,44 +8,68 @@ const pick = (groups = {}, keys = []) => {
   return 0;
 };
 const sum = (groups = {}, keys = []) => keys.reduce((acc, key) => acc + n(groups[key]), 0);
+// has(): true only when the key is actually present in the parsed data, so we can tell
+// "real zero" apart from "missing". This is what prevents double-counting: when a true
+// total line exists we use it and never fall back to summing detail lines.
+const has = (groups = {}, keys = []) => keys.some((key) => Object.prototype.hasOwnProperty.call(groups, key));
 
-const REVENUE_KEYS = [
-  'revenue', 'sales_revenue', 'healthcare_patient_revenue', 'product_sales_revenue',
-  'real_estate_sales_revenue', 'bank_net_interest_income', 'bank_interest_income',
-  'bank_net_fee_income', 'bank_fee_income', 'other_income'
+// Detail-line groups (NOT totals). Only used to derive a metric when the real total line
+// is absent from the statement. Keeping these separate from total keys is the core
+// double-count guard.
+const REVENUE_DETAIL_KEYS = [
+  'sales_revenue', 'product_sales_revenue', 'healthcare_patient_revenue',
+  'real_estate_sales_revenue', 'bank_net_interest_income', 'bank_net_fee_income',
+  'dividend_income', 'other_income', 'income_revenue_detail',
 ];
-const EXPENSE_KEYS = [
-  'expense', 'cogs', 'sga', 'healthcare_service_cost', 'real_estate_cogs',
-  'finance_cost', 'tax', 'bank_interest_expense', 'bank_expected_credit_loss',
-  'bank_other_operating_expenses'
+const EXPENSE_DETAIL_KEYS = [
+  'cogs', 'sga', 'finance_cost', 'tax', 'healthcare_service_cost', 'real_estate_cogs',
+  'bank_interest_expense', 'bank_expected_credit_loss', 'bank_other_operating_expenses',
 ];
 const COGS_KEYS = ['cogs', 'healthcare_service_cost', 'real_estate_cogs'];
 const SGA_KEYS = ['sga', 'bank_other_operating_expenses'];
-const CASH_KEYS = ['cash', 'cash_ending', 'cash_beginning'];
+const CASH_KEYS = ['cash', 'cash_ending'];
 const LOAN_KEYS = ['loan', 'bank_borrowings', 'borrowings', 'bank_debt_issued_and_borrowings'];
 
 const UNIT_CONFIG = {
   baht: { th: 'บาท', en: 'Baht', divisor: 1, suffix: '' },
-  thousand: { th: 'พันบาท', en: 'Thousand Baht', divisor: 1_000, suffix: '_k' },
-  million: { th: 'ล้านบาท', en: 'Million Baht', divisor: 1_000_000, suffix: '_m' },
+  thousand: { th: 'พันบาท', en: 'Thousand Baht', divisor: 1000, suffix: '_k' },
+  million: { th: 'ล้านบาท', en: 'Million Baht', divisor: 1000000, suffix: '_m' },
+};
+
+// Excel number formats. SheetJS applies these via cell.z.
+const FMT = {
+  amount: '#,##0;(#,##0);"-"',          // thousands separator, negatives in parens, zero as dash
+  percent: '0.0%;(0.0%);"-"',           // value must be a real ratio (0.123), not 12.3
+  multiple: '0.00"x"',
+  ratio: '0.00',
 };
 
 const TEXT = {
   th: {
-    cover: 'หน้าปก', summary: 'สรุป Dashboard', income: 'งบกำไรขาดทุน', balance: 'งบฐานะการเงิน', cashflow: 'งบกระแสเงินสด', ratios: 'อัตราส่วน', mapping: 'Mapping Review', raw: 'Raw Data', lineage: 'Data Lineage',
+    cover: 'หน้าปก', summary: 'สรุป Dashboard', income: 'งบกำไรขาดทุน', balance: 'งบฐานะการเงิน', cashflow: 'งบกระแสเงินสด', ratios: 'อัตราส่วน', checks: 'ตรวจสอบงบ', mapping: 'Mapping Review', raw: 'Raw Data', lineage: 'Data Lineage',
     company: 'บริษัท', ticker: 'Ticker', period: 'ช่วงปี', generatedAt: 'เวลาส่งออก', mode: 'โหมดข้อมูล', unit: 'หน่วย', dataStatus: 'สถานะข้อมูล', warning: 'คำเตือน',
     latest: 'Latest confirmed', snapshot: 'Historical snapshot', archived: 'Archived snapshot',
     reviewWarning: 'ไฟล์นี้มีรายการ Mapping ที่ยังต้อง Review โปรดตรวจ Account Mapping Center ก่อนใช้ประกอบการตัดสินใจ',
     clean: 'Core export generated from confirmed / selected data. โปรดตรวจตัวเลขกับงบต้นฉบับก่อนใช้งานภายนอก',
     metric: 'รายการ', yoy: 'YoY %',
+    checkTitle: 'การตรวจสอบความถูกต้องของงบ', checkItem: 'รายการตรวจสอบ', checkResult: 'ผล', checkDiff: 'ส่วนต่าง', checkPass: 'ผ่าน', checkFail: 'ไม่ผ่าน', checkNa: 'ไม่มีข้อมูล',
+    balanceCheck: 'สินทรัพย์ = หนี้สิน + ส่วนของเจ้าของ', revenuePositive: 'รายได้รวมเป็นบวก', currentAssetsCheck: 'รวมสินทรัพย์หมุนเวียน + ไม่หมุนเวียน = สินทรัพย์รวม',
+    integrityWarn: 'พบความผิดปกติของงบ โปรดตรวจ Sheet ตรวจสอบงบ ก่อนนำตัวเลขไปใช้',
+    annualPeriodCheck: 'พบงบประจำปี FY สำหรับปีที่เลือก',
+    annualPeriodMissing: 'ไม่พบงบประจำปี FY — ระบบจะไม่นำ Q/M/period อื่นมาแทนโดยอัตโนมัติ',
   },
   en: {
-    cover: 'Cover', summary: 'Dashboard Summary', income: 'Income Statement', balance: 'Balance Sheet', cashflow: 'Cash Flow', ratios: 'Ratios', mapping: 'Mapping Review', raw: 'Raw Data', lineage: 'Data Lineage',
+    cover: 'Cover', summary: 'Dashboard Summary', income: 'Income Statement', balance: 'Balance Sheet', cashflow: 'Cash Flow', ratios: 'Ratios', checks: 'Integrity Checks', mapping: 'Mapping Review', raw: 'Raw Data', lineage: 'Data Lineage',
     company: 'Company', ticker: 'Ticker', period: 'Period', generatedAt: 'Generated at', mode: 'Data mode', unit: 'Unit', dataStatus: 'Data status', warning: 'Warning',
     latest: 'Latest confirmed', snapshot: 'Historical snapshot', archived: 'Archived snapshot',
     reviewWarning: 'This export contains unreviewed accounting mappings. Review Account Mapping Center before decision use.',
     clean: 'Core export generated from confirmed / selected data. Reconcile figures with source statements before external use.',
     metric: 'Line item', yoy: 'YoY %',
+    checkTitle: 'Financial statement integrity checks', checkItem: 'Check', checkResult: 'Result', checkDiff: 'Difference', checkPass: 'PASS', checkFail: 'FAIL', checkNa: 'No data',
+    balanceCheck: 'Assets = Liabilities + Equity', revenuePositive: 'Total revenue is positive', currentAssetsCheck: 'Current + Non-current assets = Total assets',
+    integrityWarn: 'Statement integrity issues found. Review the Integrity Checks sheet before using these figures.',
+    annualPeriodCheck: 'FY annual period exists for selected year',
+    annualPeriodMissing: 'FY annual period is missing — Q/M/other periods are not silently used as annual data',
   }
 };
 
@@ -53,11 +77,20 @@ function safeSheetName(name) {
   return String(name || 'Sheet').replace(/[\\/?*\[\]:]/g, ' ').slice(0, 31) || 'Sheet';
 }
 
-function appendSheet(workbook, rows, name) {
+// Write an array-of-arrays sheet, then apply per-cell number formats from a parallel
+// format map keyed by "r,c" (0-indexed). Also sets column widths and freezes the header.
+function appendSheet(workbook, rows, name, { fmtMap = {}, freezeRow = 0 } = {}) {
   const ws = XLSX.utils.aoa_to_sheet(rows);
   const widthCount = Math.max(...rows.map((row) => row.length), 1);
-  ws['!cols'] = Array.from({ length: widthCount }, (_, idx) => ({ wch: idx === 0 ? 34 : 16 }));
+  ws['!cols'] = Array.from({ length: widthCount }, (_, idx) => ({ wch: idx === 0 ? 40 : 16 }));
+  for (const [key, z] of Object.entries(fmtMap)) {
+    const [r, c] = key.split(',').map(Number);
+    const ref = XLSX.utils.encode_cell({ r, c });
+    if (ws[ref] && typeof ws[ref].v === 'number') ws[ref].z = z;
+  }
+  if (freezeRow > 0) ws['!freeze'] = { xSplit: 0, ySplit: freezeRow, topLeftCell: XLSX.utils.encode_cell({ r: freezeRow, c: 0 }), activePane: 'bottomLeft', state: 'frozen' };
   XLSX.utils.book_append_sheet(workbook, ws, safeSheetName(name));
+  return ws;
 }
 
 function appendJsonSheet(workbook, records, name) {
@@ -65,40 +98,76 @@ function appendJsonSheet(workbook, records, name) {
   const ws = XLSX.utils.json_to_sheet(rows);
   const headers = Object.keys(rows[0] || {});
   ws['!cols'] = headers.map((key) => ({ wch: Math.min(Math.max(String(key).length + 4, 14), 42) }));
+  ws['!freeze'] = { xSplit: 0, ySplit: 1, topLeftCell: 'A2', activePane: 'bottomLeft', state: 'frozen' };
   XLSX.utils.book_append_sheet(workbook, ws, safeSheetName(name));
 }
 
-function displayText(mode, th, bilingual) {
-  const t = TEXT[th ? 'th' : 'en'];
-  const other = TEXT[th ? 'en' : 'th'];
-  return bilingual ? `${t[mode]} / ${other[mode]}` : t[mode];
-}
-
-function getAnnualGroups(store, companyId, year) {
+function getAnnualSelection(store, companyId, year, { strictAnnual = true } = {}) {
   const yearData = store?.[companyId]?.[year] || store?.[String(companyId)]?.[year] || store?.[companyId]?.[String(year)] || store?.[String(companyId)]?.[String(year)] || {};
-  const period = yearData.FY || Object.values(yearData).find((record) => record?.groups);
-  return period?.groups || {};
+  if (yearData.FY?.groups) return { groups: yearData.FY.groups, periodKey: 'FY', missingAnnual: false };
+  if (strictAnnual) return { groups: {}, periodKey: null, missingAnnual: true };
+
+  const candidates = Object.entries(yearData)
+    .filter(([key, record]) => !String(key).startsWith('_') && record?.groups)
+    .map(([key, record]) => ({ key, groups: record.groups }));
+  if (!candidates.length) return { groups: {}, periodKey: null, missingAnnual: true };
+  const best = candidates.reduce((best, item) => (Object.keys(item.groups).length > Object.keys(best.groups).length ? item : best), candidates[0]);
+  return { groups: best.groups, periodKey: best.key, missingAnnual: true };
 }
 
-function getMetrics(groups = {}) {
-  const revenue = pick(groups, ['revenue']) || sum(groups, REVENUE_KEYS.filter(k => k !== 'revenue'));
+function buildStoreFromNormalizedRows(rows = [], importBatches = []) {
+  const batchMeta = new Map((importBatches || []).map((batch) => [batch.id, batch]));
+  const store = {};
+  (rows || []).forEach((record) => {
+    const companyId = record.company_id;
+    const year = record.fiscal_year;
+    if (!companyId || !year) return;
+    const batch = batchMeta.get(record.import_batch_id || record.batch_id) || {};
+    const status = batch.status || record.import_status || 'confirmed';
+    if (['superseded', 'rolled_back', 'rejected'].includes(status)) return;
+    const periodKey = record.period || batch.period || 'FY';
+    store[companyId] ||= {};
+    store[companyId][year] ||= {};
+    store[companyId][year][periodKey] ||= {
+      groups: {},
+      row_count: 0,
+      review_count: 0,
+      import_batch_id: record.import_batch_id || batch.id || null,
+      _statementScope: record.statement_scope || batch.statement_scope || null,
+      _sourceFile: record.source_file || batch.file_name || null,
+      _batchStatus: status,
+    };
+    const target = store[companyId][year][periodKey];
+    const groupKey = record.account_group || 'other';
+    target.groups[groupKey] = (target.groups[groupKey] || 0) + n(record.amount);
+    target.row_count += 1;
+    if (record.needs_review) target.review_count += 1;
+  });
+  return store;
+}
+
+function getMetrics(groups = {}, meta = {}) {
+  // Revenue: use the real total line if present; otherwise derive from detail lines.
+  const revenue = has(groups, ['revenue']) ? pick(groups, ['revenue']) : sum(groups, REVENUE_DETAIL_KEYS);
   const cogs = sum(groups, COGS_KEYS);
   const sga = sum(groups, SGA_KEYS);
   const financeCost = pick(groups, ['finance_cost', 'bank_interest_expense']);
   const tax = pick(groups, ['tax']);
-  const expense = pick(groups, ['expense']) || sum(groups, EXPENSE_KEYS.filter(k => k !== 'expense'));
+  // Expense: prefer the real total. Never combine total + details.
+  const expense = has(groups, ['expense']) ? pick(groups, ['expense']) : sum(groups, EXPENSE_DETAIL_KEYS);
   const grossProfit = revenue - cogs;
-  const operatingProfit = pick(groups, ['operating_profit']) || (revenue ? grossProfit - sga : 0);
-  const profitBeforeTax = pick(groups, ['profit_before_tax']) || (operatingProfit - financeCost);
-  const netProfit = pick(groups, ['net_profit']) || (revenue ? revenue - expense : 0);
+  const operatingProfit = has(groups, ['operating_profit']) ? pick(groups, ['operating_profit']) : (revenue ? grossProfit - sga : 0);
+  const profitBeforeTax = has(groups, ['profit_before_tax']) ? pick(groups, ['profit_before_tax']) : (operatingProfit - financeCost);
+  // Net profit: use the reported total when present; otherwise revenue - expense.
+  const netProfit = has(groups, ['net_profit']) ? pick(groups, ['net_profit']) : (revenue ? revenue - expense : 0);
   const asset = pick(groups, ['asset']);
   const liability = pick(groups, ['liability']);
   const equity = pick(groups, ['equity']);
   const cash = pick(groups, CASH_KEYS);
-  const currentAssets = pick(groups, ['total_current_assets', 'current_assets']);
-  const nonCurrentAssets = pick(groups, ['total_non_current_assets', 'non_current_assets']);
-  const currentLiabilities = pick(groups, ['total_current_liabilities', 'current_liabilities']);
-  const nonCurrentLiabilities = pick(groups, ['total_non_current_liabilities', 'non_current_liabilities']);
+  const currentAssets = pick(groups, ['total_current_assets']);
+  const nonCurrentAssets = pick(groups, ['total_non_current_assets']);
+  const currentLiabilities = pick(groups, ['total_current_liabilities']);
+  const nonCurrentLiabilities = pick(groups, ['total_non_current_liabilities']);
   const loans = pick(groups, LOAN_KEYS);
   const cfo = pick(groups, ['operating_cash_flow']);
   const cfi = pick(groups, ['investing_cash_flow']);
@@ -109,17 +178,33 @@ function getMetrics(groups = {}) {
     revenue, cogs, grossProfit, sga, operatingProfit, financeCost, profitBeforeTax, tax, expense, netProfit,
     cash, currentAssets, nonCurrentAssets, asset, currentLiabilities, nonCurrentLiabilities, liability, equity, loans,
     cfo, cfi, cff, dividendPaid, fcf,
-    grossMargin: revenue ? (grossProfit / revenue) * 100 : 0,
-    operatingMargin: revenue ? (operatingProfit / revenue) * 100 : 0,
-    netMargin: revenue ? (netProfit / revenue) * 100 : 0,
-    cogsRatio: revenue ? (cogs / revenue) * 100 : 0,
-    sgaRatio: revenue ? (sga / revenue) * 100 : 0,
+    // Ratios stored as TRUE RATIOS (0.123 = 12.3%) so Excel % format renders correctly.
+    grossMargin: revenue ? grossProfit / revenue : 0,
+    operatingMargin: revenue ? operatingProfit / revenue : 0,
+    netMargin: revenue ? netProfit / revenue : 0,
+    cogsRatio: revenue ? cogs / revenue : 0,
+    sgaRatio: revenue ? sga / revenue : 0,
     currentRatio: currentLiabilities ? currentAssets / currentLiabilities : 0,
     debtToEquity: equity ? liability / equity : 0,
-    roa: asset ? (netProfit / asset) * 100 : 0,
-    roe: equity ? (netProfit / equity) * 100 : 0,
+    roa: asset ? netProfit / asset : 0,
+    roe: equity ? netProfit / equity : 0,
+    // Raw fields needed by integrity checks (kept unscaled in baht).
+    _raw: { asset, liability, equity, currentAssets, nonCurrentAssets, revenue },
+    _present: {
+      asset: has(groups, ['asset']),
+      liability: has(groups, ['liability']),
+      equity: has(groups, ['equity']),
+      currentAssets: has(groups, ['total_current_assets']),
+      nonCurrentAssets: has(groups, ['total_non_current_assets']),
+      revenue: has(groups, ['revenue']) || REVENUE_DETAIL_KEYS.some((key) => has(groups, [key])),
+    },
+    _meta: { ...meta },
   };
 }
+
+// Which metric keys are percentages vs multiples (for cell formatting on the ratio sheet).
+const PERCENT_METRICS = new Set(['grossMargin', 'operatingMargin', 'netMargin', 'cogsRatio', 'sgaRatio', 'roa', 'roe']);
+const MULTIPLE_METRICS = new Set(['debtToEquity', 'currentRatio']);
 
 function metricRows(th, bilingual) {
   const label = (thText, enText) => bilingual ? `${thText} / ${enText}` : (th ? thText : enText);
@@ -142,10 +227,10 @@ function metricRows(th, bilingual) {
       ['dividendPaid', label('เงินปันผลจ่าย', 'Dividend paid')],
     ],
     ratios: [
-      ['grossMargin', label('อัตรากำไรขั้นต้น %', 'Gross margin %')], ['operatingMargin', label('อัตรากำไรจากการดำเนินงาน %', 'Operating margin %')],
-      ['netMargin', label('อัตรากำไรสุทธิ %', 'Net margin %')], ['cogsRatio', label('ต้นทุนขายต่อรายได้ %', 'COGS / Revenue %')],
-      ['sgaRatio', label('SG&A ต่อรายได้ %', 'SG&A / Revenue %')], ['currentRatio', label('Current ratio', 'Current ratio')],
-      ['debtToEquity', label('หนี้สินต่อทุน', 'Debt to equity')], ['roa', label('ROA %', 'ROA %')], ['roe', label('ROE %', 'ROE %')],
+      ['grossMargin', label('อัตรากำไรขั้นต้น', 'Gross margin')], ['operatingMargin', label('อัตรากำไรจากการดำเนินงาน', 'Operating margin')],
+      ['netMargin', label('อัตรากำไรสุทธิ', 'Net margin')], ['cogsRatio', label('ต้นทุนขายต่อรายได้', 'COGS / Revenue')],
+      ['sgaRatio', label('SG&A ต่อรายได้', 'SG&A / Revenue')], ['currentRatio', label('Current ratio', 'Current ratio')],
+      ['debtToEquity', label('หนี้สินต่อทุน', 'Debt to equity')], ['roa', label('ROA', 'ROA')], ['roe', label('ROE', 'ROE')],
     ],
   };
 }
@@ -154,98 +239,144 @@ function scaled(value, unit) {
   return n(value) / (UNIT_CONFIG[unit]?.divisor || 1);
 }
 
-function statementSheetRows(title, metricList, metricsByYear, years, unit, lang) {
+// Build a statement sheet with year columns plus a true year-over-year column for each
+// adjacent pair, and a format map for SheetJS. `isRatioSheet` switches amount formatting
+// to percent/multiple per metric key.
+function statementSheet(workbook, title, metricList, metricsByYear, years, unit, lang, isRatioSheet = false) {
   const t = TEXT[lang];
-  const rows = [[title], [t.unit, UNIT_CONFIG[unit]?.[lang] || unit], [], [t.metric, ...years.map(String), t.yoy]];
-  for (const [key, label] of metricList) {
-    const values = years.map((year) => scaled(metricsByYear[year]?.[key], unit));
-    const first = values[0];
-    const last = values[values.length - 1];
-    const yoy = values.length > 1 && first ? ((last - first) / Math.abs(first)) * 100 : '';
-    rows.push([label, ...values, yoy]);
+  const yoyHeaders = years.length > 1 ? years.slice(1).map((y, i) => `${t.yoy} ${years[i]}->${y}`) : [];
+  const header = [t.metric, ...years.map(String), ...yoyHeaders];
+  const rows = [[title], [t.unit, isRatioSheet ? (lang === 'th' ? 'เท่า / %' : 'x / %') : (UNIT_CONFIG[unit]?.[lang] || unit)], [], header];
+  const headerRowIdx = 3;
+  const fmtMap = {};
+
+  metricList.forEach(([key, label], i) => {
+    const r = headerRowIdx + 1 + i;
+    const isPct = isRatioSheet && PERCENT_METRICS.has(key);
+    const isMult = isRatioSheet && MULTIPLE_METRICS.has(key);
+    const values = years.map((year) => {
+      const v = metricsByYear[year]?.[key];
+      return isRatioSheet ? n(v) : scaled(v, unit);
+    });
+    const row = [label, ...values];
+    // True per-pair YoY (only meaningful for amount metrics).
+    if (years.length > 1) {
+      years.slice(1).forEach((year, idx) => {
+        const prev = values[idx];
+        const curr = values[idx + 1];
+        row.push((!isRatioSheet && prev) ? (curr - prev) / Math.abs(prev) : '');
+      });
+    }
+    rows.push(row);
+    // Format value columns.
+    years.forEach((_, c) => {
+      const col = 1 + c;
+      if (isPct) fmtMap[`${r},${col}`] = FMT.percent;
+      else if (isMult) fmtMap[`${r},${col}`] = FMT.multiple;
+      else fmtMap[`${r},${col}`] = FMT.amount;
+    });
+    // YoY columns always percent.
+    if (years.length > 1) {
+      years.slice(1).forEach((_, idx) => { fmtMap[`${r},${1 + years.length + idx}`] = FMT.percent; });
+    }
+  });
+  appendSheet(workbook, rows, title, { fmtMap, freezeRow: headerRowIdx + 1 });
+}
+
+// Integrity checks per year. Tolerance 1% of the larger side (or 1 baht floor).
+function buildIntegrityRows(metricsByYear, years, lang) {
+  const t = TEXT[lang];
+  const rows = [[t.checkTitle], [], [t.checkItem, t.period, t.checkResult, t.checkDiff]];
+  let anyFail = false;
+  const tol = (a, b) => Math.max(Math.abs(a), Math.abs(b)) * 0.01 + 1;
+  const present = (obj, key, flags = null) => flags ? Boolean(flags[key]) : (Object.prototype.hasOwnProperty.call(obj || {}, key) && obj[key] !== undefined && obj[key] !== null && obj[key] !== '');
+
+  for (const year of years) {
+    const m = metricsByYear[year]?._raw || {};
+    const meta = metricsByYear[year]?._meta || {};
+    const flags = metricsByYear[year]?._present || {};
+    if (meta.missingAnnual) {
+      anyFail = true;
+      rows.push([t.annualPeriodCheck, year, t.checkFail, t.annualPeriodMissing]);
+    } else {
+      rows.push([t.annualPeriodCheck, year, t.checkPass, '']);
+    }
+    // 1. Assets = Liabilities + Equity
+    if (present(m, 'asset', flags) || present(m, 'liability', flags) || present(m, 'equity', flags)) {
+      const diff = m.asset - (m.liability + m.equity);
+      const pass = Math.abs(diff) <= tol(m.asset, m.liability + m.equity);
+      if (!pass) anyFail = true;
+      rows.push([t.balanceCheck, year, pass ? t.checkPass : t.checkFail, diff]);
+    } else {
+      rows.push([t.balanceCheck, year, t.checkNa, '']);
+    }
+    // 2. Revenue positive
+    if (present(m, 'revenue', flags)) {
+      const pass = m.revenue > 0;
+      if (!pass) anyFail = true;
+      rows.push([t.revenuePositive, year, pass ? t.checkPass : t.checkFail, m.revenue]);
+    } else {
+      rows.push([t.revenuePositive, year, t.checkNa, '']);
+    }
+    // 3. Current + Non-current assets = Total assets (only when both subtotals exist)
+    if (present(m, 'currentAssets', flags) && present(m, 'nonCurrentAssets', flags) && present(m, 'asset', flags)) {
+      const diff = (m.currentAssets + m.nonCurrentAssets) - m.asset;
+      const pass = Math.abs(diff) <= tol(m.currentAssets + m.nonCurrentAssets, m.asset);
+      if (!pass) anyFail = true;
+      rows.push([t.currentAssetsCheck, year, pass ? t.checkPass : t.checkFail, diff]);
+    } else {
+      rows.push([t.currentAssetsCheck, year, t.checkNa, '']);
+    }
   }
-  return rows;
+  return { rows, anyFail };
 }
 
 function normalizeRawRows(rawRows = []) {
   return rawRows.map((row) => ({
-    company_id: row.company_id,
-    fiscal_year: row.fiscal_year,
-    period: row.period,
-    statement_type: row.statement_type,
-    source_sheet: row.source_sheet,
-    source_row: row.source_row,
-    raw_account_name: row.raw_account_name,
-    account_name: row.account_name,
-    account_group: row.account_group,
-    account_subgroup: row.account_subgroup,
-    amount: row.amount,
-    needs_review: row.needs_review,
-    mapping_confidence: row.mapping_confidence,
-    mapping_source: row.mapping_source,
-    review_reason: row.review_reason,
-    import_status: row.import_status,
-    import_batch_id: row.import_batch_id,
-    source_file: row.source_file,
+    company_id: row.company_id, fiscal_year: row.fiscal_year, period: row.period,
+    statement_type: row.statement_type, source_sheet: row.source_sheet, source_row: row.source_row,
+    raw_account_name: row.raw_account_name, account_name: row.account_name, account_group: row.account_group,
+    account_subgroup: row.account_subgroup, amount: row.amount, needs_review: row.needs_review,
+    mapping_confidence: row.mapping_confidence, mapping_source: row.mapping_source, review_reason: row.review_reason,
+    import_status: row.import_status, import_batch_id: row.import_batch_id, source_file: row.source_file,
   }));
 }
 
 function normalizeMappingRows(mappingRows = []) {
   return mappingRows.map((row) => ({
-    company: row.companies?.ticker_symbol || row.company_id,
-    fiscal_year: row.fiscal_year,
-    statement_type: row.statement_type,
-    raw_account_name: row.raw_account_name,
-    current_group: row.account_group,
-    suggested_group: row.suggested_account_group,
-    confidence: row.mapping_confidence,
-    source: row.mapping_source,
-    needs_review: row.needs_review,
-    review_reason: row.review_reason,
-    source_file: row.source_file,
-    source_sheet: row.source_sheet,
-    source_row: row.source_row,
+    company: row.companies?.ticker_symbol || row.company_id, fiscal_year: row.fiscal_year,
+    statement_type: row.statement_type, raw_account_name: row.raw_account_name, current_group: row.account_group,
+    suggested_group: row.suggested_account_group, confidence: row.mapping_confidence, source: row.mapping_source,
+    needs_review: row.needs_review, review_reason: row.review_reason, source_file: row.source_file,
+    source_sheet: row.source_sheet, source_row: row.source_row,
   }));
 }
 
 function normalizeLineageRows(importBatches = []) {
   return importBatches.map((row) => ({
-    imported_at: row.imported_at,
-    company: row.companies?.ticker_symbol || row.company_id,
-    fiscal_year: row.fiscal_year,
-    period_type: row.period_type,
-    period: row.period,
-    file_name: row.file_name,
-    status: row.status,
-    total_rows: row.total_rows,
-    review_count: row.review_count,
-    source_type: row.source_type,
-    parser_profile: row.parser_profile,
-    batch_id: row.id,
+    imported_at: row.imported_at, company: row.companies?.ticker_symbol || row.company_id, fiscal_year: row.fiscal_year,
+    period_type: row.period_type, period: row.period, file_name: row.file_name, status: row.status,
+    total_rows: row.total_rows, review_count: row.review_count, source_type: row.source_type,
+    parser_profile: row.parser_profile, batch_id: row.id,
   }));
 }
 
 export function buildFinancialExcelWorkbook({
-  company = {},
-  companyId,
-  store = {},
-  years = [],
-  importBatches = [],
-  rawRows = [],
-  mappingRows = [],
-  language = 'th',
-  labelMode = 'bilingual',
-  unit = 'million',
-  mode = 'latest',
+  company = {}, companyId, store = {}, years = [], importBatches = [],
+  rawRows = [], normalizedRows = [], monthlyRows = [], trialBalanceRows = [], mappingRows = [], language = 'th', labelMode = 'bilingual',
+  unit = 'million', mode = 'latest', strictAnnual = true,
 } = {}) {
   const lang = language === 'en' ? 'en' : 'th';
   const th = lang === 'th';
   const bilingual = labelMode === 'bilingual';
   const t = TEXT[lang];
   const actualYears = years.map(Number).filter(Boolean).sort((a, b) => a - b);
-  const metricsByYear = Object.fromEntries(actualYears.map((year) => [year, getMetrics(getAnnualGroups(store, companyId || company.id, year))]));
+  const sourceStore = normalizedRows?.length ? buildStoreFromNormalizedRows(normalizedRows, importBatches) : store;
+  const selectionsByYear = Object.fromEntries(actualYears.map((year) => [year, getAnnualSelection(sourceStore, companyId || company.id, year, { strictAnnual })]));
+  const metricsByYear = Object.fromEntries(actualYears.map((year) => [year, getMetrics(selectionsByYear[year]?.groups || {}, { missingAnnual: Boolean(selectionsByYear[year]?.missingAnnual), periodKey: selectionsByYear[year]?.periodKey || null })]));
   const reviewRows = mappingRows.filter((row) => row?.needs_review !== false || row?.account_group === 'other' || Number(row?.mapping_confidence) < 0.86);
   const hasImportantReview = reviewRows.length > 0;
+  const { rows: integrityRows, anyFail: hasIntegrityIssue } = buildIntegrityRows(metricsByYear, actualYears, lang);
   const rows = metricRows(th, bilingual);
   const wb = XLSX.utils.book_new();
 
@@ -259,22 +390,64 @@ export function buildFinancialExcelWorkbook({
     [t.mode, mode === 'latest' ? t.latest : mode === 'archived_snapshot' ? t.archived : t.snapshot],
     [t.unit, UNIT_CONFIG[unit]?.[lang] || unit],
     [t.dataStatus, hasImportantReview ? t.reviewWarning : t.clean],
+    ...(hasIntegrityIssue ? [[t.warning, t.integrityWarn]] : []),
     [],
     [t.warning, 'AI can help map accounts, but exported figures should be reconciled with source financial statements before external or filing use.'],
   ], t.cover);
 
-  appendSheet(wb, statementSheetRows(t.summary, [
-    ['revenue', th ? 'รายได้รวม' : 'Total revenue'], ['netProfit', th ? 'กำไรสุทธิ' : 'Net profit'], ['asset', th ? 'สินทรัพย์รวม' : 'Total assets'],
-    ['liability', th ? 'หนี้สินรวม' : 'Total liabilities'], ['equity', th ? 'ส่วนของเจ้าของ' : 'Equity'], ['netMargin', th ? 'Net margin %' : 'Net margin %'], ['debtToEquity', th ? 'D/E' : 'D/E'],
-  ], metricsByYear, actualYears, unit, lang), t.summary);
-  appendSheet(wb, statementSheetRows(t.income, rows.income, metricsByYear, actualYears, unit, lang), t.income);
-  appendSheet(wb, statementSheetRows(t.balance, rows.balance, metricsByYear, actualYears, unit, lang), t.balance);
-  appendSheet(wb, statementSheetRows(t.cashflow, rows.cashflow, metricsByYear, actualYears, unit, lang), t.cashflow);
-  appendSheet(wb, statementSheetRows(t.ratios, rows.ratios, metricsByYear, actualYears, 'baht', lang), t.ratios);
+  // Summary sheet: amounts + ratios mixed, so format per-row.
+  const summaryMetrics = [
+    ['revenue', th ? 'รายได้รวม' : 'Total revenue', 'amount'], ['netProfit', th ? 'กำไรสุทธิ' : 'Net profit', 'amount'],
+    ['asset', th ? 'สินทรัพย์รวม' : 'Total assets', 'amount'], ['liability', th ? 'หนี้สินรวม' : 'Total liabilities', 'amount'],
+    ['equity', th ? 'ส่วนของเจ้าของ' : 'Equity', 'amount'], ['netMargin', th ? 'Net margin' : 'Net margin', 'percent'],
+    ['debtToEquity', th ? 'D/E' : 'D/E', 'multiple'],
+  ];
+  {
+    const yoyHeaders = actualYears.length > 1 ? actualYears.slice(1).map((y, i) => `${t.yoy} ${actualYears[i]}->${y}`) : [];
+    const srows = [[t.summary], [t.unit, UNIT_CONFIG[unit]?.[lang] || unit], [], [t.metric, ...actualYears.map(String), ...yoyHeaders]];
+    const fmtMap = {};
+    summaryMetrics.forEach(([key, label, kind], i) => {
+      const r = 4 + i;
+      const isAmount = kind === 'amount';
+      const values = actualYears.map((year) => isAmount ? scaled(metricsByYear[year]?.[key], unit) : n(metricsByYear[year]?.[key]));
+      const row = [label, ...values];
+      if (actualYears.length > 1) {
+        actualYears.slice(1).forEach((year, idx) => {
+          const prev = values[idx], curr = values[idx + 1];
+          row.push((isAmount && prev) ? (curr - prev) / Math.abs(prev) : '');
+        });
+      }
+      srows.push(row);
+      actualYears.forEach((_, c) => { fmtMap[`${r},${1 + c}`] = kind === 'percent' ? FMT.percent : kind === 'multiple' ? FMT.multiple : FMT.amount; });
+      if (actualYears.length > 1) actualYears.slice(1).forEach((_, idx) => { if (isAmount) fmtMap[`${r},${1 + actualYears.length + idx}`] = FMT.percent; });
+    });
+    appendSheet(wb, srows, t.summary, { fmtMap, freezeRow: 4 });
+  }
+
+  statementSheet(wb, t.income, rows.income, metricsByYear, actualYears, unit, lang);
+  statementSheet(wb, t.balance, rows.balance, metricsByYear, actualYears, unit, lang);
+  statementSheet(wb, t.cashflow, rows.cashflow, metricsByYear, actualYears, unit, lang);
+  statementSheet(wb, t.ratios, rows.ratios, metricsByYear, actualYears, 'baht', lang, true);
+
+  // Integrity checks sheet with format on the difference column.
+  {
+    const fmtMap = {};
+    integrityRows.forEach((row, r) => { if (typeof row[3] === 'number') fmtMap[`${r},3`] = FMT.amount; });
+    appendSheet(wb, integrityRows, t.checks, { fmtMap, freezeRow: 3 });
+  }
+
   appendJsonSheet(wb, normalizeMappingRows(reviewRows), t.mapping);
   appendJsonSheet(wb, normalizeRawRows(rawRows), t.raw);
   appendJsonSheet(wb, normalizeLineageRows(importBatches), t.lineage);
+
+  wb._integrity = { hasIntegrityIssue, hasImportantReview };
   return wb;
+}
+
+
+export function previewFinancialExcelExport(options = {}) {
+  const wb = buildFinancialExcelWorkbook(options);
+  return { integrity: wb._integrity || {} };
 }
 
 export function exportFinancialExcel(options = {}) {
@@ -287,5 +460,6 @@ export function exportFinancialExcel(options = {}) {
   const mode = options.mode === 'latest' ? 'latest' : 'snapshot';
   const fileName = `${String(ticker).replace(/[^a-zA-Z0-9ก-ฮ_-]+/g, '_')}_Financial_Export_${yearPart}${unit}_${mode}.xlsx`;
   XLSX.writeFile(wb, fileName, { compression: true });
-  return fileName;
+  // Return both filename and integrity flags so the UI can warn the user.
+  return { fileName, integrity: wb._integrity || {} };
 }

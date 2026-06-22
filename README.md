@@ -1,3 +1,29 @@
+## v1.7.8 — Export Accuracy, Parser Integrity & Scheduled Alerts
+
+This release hardens financial accuracy across export, parser, and alerting.
+
+### Excel Export Center fixes
+- **No more double-counting.** `getMetrics()` now uses the real total line (e.g. `revenue`, `expense`, `net_profit`) when it exists and only derives from detail lines when the total is genuinely missing. Previously a statement containing both a total and its detail rows could be summed twice.
+- **Annual period selection is deterministic.** `getAnnualGroups()` always prefers the explicit `FY` period and, when absent, falls back to the most complete period instead of an arbitrary one.
+- **Integrity checks before you trust the numbers.** A new `Integrity Checks` sheet validates `Assets = Liabilities + Equity`, positive revenue, and `Current + Non-current assets = Total assets` per year. If any check fails, the Cover sheet and the in-app export status both show a warning.
+- **Proper Excel number formatting.** Amounts use `#,##0` with parentheses for negatives and `-` for zero; ratios are stored as true ratios and rendered with `0.0%`; Debt-to-equity and Current ratio use a `0.00x` multiple format. Column widths are set and headers are frozen (freeze pane requires SheetJS Pro; community edition ignores it safely).
+- **Year-over-year is now per pair.** YoY columns are computed for each adjacent year pair, not only first vs last.
+- `exportFinancialExcel()` now returns `{ fileName, integrity }` so the UI can warn on imbalance.
+
+### Parser hardening
+- **Inferred revenue stays flagged.** `promoteRevenueFallback()` no longer clears `needs_review`; a single detail line promoted to total revenue is kept for confirmation.
+- **Sign normalization is no longer silent.** When an expense sign is flipped to positive, the row is flagged for review with a clear reason.
+- **Post-parse integrity.** The parser summary now includes an `integrity` block; the Import Wizard surfaces any balance-sheet or revenue-sign issues before save.
+- **Content-based industry detection.** Industry is now classified from statement-line signals with company/ticker names used only as a weak tie-breaker, so new companies are detected correctly.
+
+### Scheduled LINE alerts
+- New migration `202606230001_alert_dispatch_cron.sql` adds a `pg_cron` job (every 5 minutes) that invokes the `line-dispatch-alerts` Edge Function via `pg_net`. Configure `app.alert_dispatch_url` and `app.alert_dispatch_secret` on the database; the job is a no-op until configured and fails closed without the secret.
+
+### Data quality
+- The Excel Export preview now shows a Data Quality score (percent of clean, non-review rows) before export.
+
+No data migration is required for the export/parser changes. Run `202606230001_alert_dispatch_cron.sql` only if you want scheduled LINE delivery.
+
 ## v1.5.3 Legal Entity Type Upload Options
 
 - Adds explicit legal entity type options to company creation and upload workflows:
@@ -387,3 +413,25 @@ What is included:
 - Safety rule: exported figures come from Supabase data and deterministic formulas only. AI/mapping logic can suggest classifications but must not invent financial statement figures.
 
 No new SQL migration is required for v1.7.7 if v1.7.6 migrations through `202606220009_private_snapshot_reconcile.sql` have already been run.
+
+## v1.7.9 Safe Export + Batch-Exact Accounting
+
+This release hardens the Excel Export Center after the v1.7.8 review.
+
+Key changes:
+
+- Excel export now prefers exact batch rows (`normalized_financial_data.import_batch_id`) over stale frontend store data.
+- Latest export only selects confirmed annual/FY batches and includes `statement_scope` in the selection key.
+- Annual export is strict: Q/M/other periods are not silently used as FY annual data.
+- Export runs a preflight preview and asks for confirmation before downloading if integrity or mapping warnings exist.
+- Integrity Checks now distinguish a real zero from a missing line item.
+- Import Wizard dropdown edits are treated as draft mapping changes, not approved mappings.
+- Private monthly preview rows are flagged for review rather than auto-approved.
+- Parser integrity validation now groups by fiscal year + period + period type + statement scope.
+- LINE cron migration from the Claude review package is intentionally omitted for now.
+
+Run this extra migration after v1.7.6/1.7.7/1.7.8 migrations if you want the additional alert table RLS hardening:
+
+```text
+supabase/migrations/202606230002_export_security_hardening.sql
+```

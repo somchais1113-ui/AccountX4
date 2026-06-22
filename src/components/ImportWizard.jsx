@@ -144,7 +144,9 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
           fiscal_year: row.fiscal_year,
           amount: row.revenue || row.expense || row.cash_in || row.cash_out || row.loan_balance || 0,
           account_group: 'monthly_operating',
-          needs_review: false,
+          mapping_source: 'private_monthly_parser',
+          review_reason: th ? 'ตรวจโครงสร้างรายงานรายเดือนก่อนใช้งานจริง' : 'Review monthly report structure before final use',
+          needs_review: true,
         }))
         : sourceType === 'private_trial_balance'
           ? payload.trialBalanceRows.map(row => ({
@@ -239,7 +241,12 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
   const updateRow = (idx, field, value) => {
     const newData = [...parsedData];
     newData[idx][field] = value;
-    if (field === 'account_group') newData[idx].needs_review = false;
+    if (field === 'account_group') {
+      newData[idx].needs_review = true;
+      newData[idx].mapping_source = 'manual_draft';
+      newData[idx].suggested_account_group = value;
+      newData[idx].review_reason = th ? 'แก้ dropdown แล้ว แต่ยังต้องกด Confirm ใน Account Mapping Center ก่อนถือว่า approved' : 'Dropdown edited as a draft; confirm it in Account Mapping Center before treating it as approved.';
+    }
     setParsedData(newData);
   };
 
@@ -388,6 +395,25 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
           <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 10, padding: 12 }}>
             <div style={{ fontSize: 12, color: C.muted }}>{th ? 'ต้องตรวจสอบ' : 'Needs Review'}</div>
             <div style={{ fontWeight: 800, color: parseSummary.reviewCount ? C.amber : C.green }}>{parseSummary.reviewCount || 0}</div>
+          </div>
+        </div>
+      )}
+
+      {parseSummary?.integrity && !parseSummary.integrity.passed && Array.isArray(parseSummary.integrity.issues) && parseSummary.integrity.issues.length > 0 && (
+        <div style={{ marginBottom: 16, padding: 14, borderRadius: 10, background: C.amberLo, border: `1px solid ${C.amber}` }}>
+          <div style={{ fontWeight: 900, color: C.amber, marginBottom: 8 }}>
+            ⚠ {th ? 'พบความผิดปกติของงบหลังแปลงข้อมูล' : 'Statement integrity issues detected after parsing'}
+          </div>
+          <div style={{ fontSize: 13, color: C.text, lineHeight: 1.6 }}>
+            {parseSummary.integrity.issues.slice(0, 8).map((issue, i) => (
+              <div key={i}>
+                • {th ? 'ปี' : 'FY'} {th ? issue.year + 543 : issue.year} ({issue.scope}) — {issue.message}
+                {Number.isFinite(issue.difference) ? ` (${th ? 'ส่วนต่าง' : 'diff'}: ${new Intl.NumberFormat().format(Math.round(issue.difference))})` : ''}
+              </div>
+            ))}
+          </div>
+          <div style={{ fontSize: 12, color: C.muted, marginTop: 8 }}>
+            {th ? 'ยังบันทึกได้ แต่ควรตรวจ Mapping ของรายการรวม (สินทรัพย์/หนี้สิน/ส่วนของเจ้าของ) ก่อนนำตัวเลขไปใช้' : 'You can still save, but verify the mapping of total lines (assets/liabilities/equity) before using these figures.'}
           </div>
         </div>
       )}

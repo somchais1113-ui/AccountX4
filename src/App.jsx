@@ -1992,6 +1992,7 @@ function ExportCenterPage({ companies, store, importHistory, currentCompanyId, c
   const [startYear, setStartYear] = useState(Number(currentYear) || new Date().getFullYear());
   const [endYear, setEndYear] = useState(Number(currentYear) || new Date().getFullYear());
   const [sourceMode, setSourceMode] = useState("latest");
+  const [statementScope, setStatementScope] = useState("consolidated");
   const [selectedBatchId, setSelectedBatchId] = useState("");
   const [unit, setUnit] = useState("million");
   const [labelMode, setLabelMode] = useState("bilingual");
@@ -2030,13 +2031,20 @@ function ExportCenterPage({ companies, store, importHistory, currentCompanyId, c
     for (const row of companyBatches) {
       if (row.status !== 'confirmed') continue;
       if (!allowedYears.has(Number(row.fiscal_year))) continue;
-      const key = `${row.company_id}|${row.fiscal_year}|${row.period || 'FY'}|${row.period_type || 'annual'}`;
+      const rowScope = row.statement_scope || 'consolidated';
+      if (statementScope !== 'all' && rowScope !== statementScope) continue;
+      const period = row.period || 'FY';
+      const periodType = row.period_type || 'annual';
+      // Export Center is intentionally annual/FY strict. Do not let Q/M snapshots
+      // become annual reports silently.
+      if (String(period).toUpperCase() !== 'FY' || !['annual', 'fy', 'yearly'].includes(String(periodType).toLowerCase())) continue;
+      const key = `${row.company_id}|${row.fiscal_year}|${period}|${periodType}|${rowScope}`;
       if (seen.has(key)) continue;
       seen.add(key);
       selected.push(row);
     }
     return selected;
-  }, [companyBatches, yearsToExport.join('|')]);
+  }, [companyBatches, yearsToExport.join('|'), statementScope]);
 
   const selectedBatch = companyBatches.find((row) => row.id === selectedBatchId) || companyBatches[0] || null;
 
@@ -2044,9 +2052,9 @@ function ExportCenterPage({ companies, store, importHistory, currentCompanyId, c
   const labelStyle = {fontSize:12,color:C.muted,fontWeight:900,textTransform:"uppercase",letterSpacing:"0.04em",marginBottom:7};
 
   const loadRowsForBatches = async (batches = []) => {
-    if (!isSupabaseConfigured || !includeRaw) return { normalized: [], monthly: [], trialBalance: [] };
+    if (!isSupabaseConfigured) return { normalized: [], monthly: [], trialBalance: [] };
     const ids = batches.map((row) => row.id).filter(Boolean).slice(0, 20);
-    const chunks = await Promise.all(ids.map((batchId) => loadImportBatchRows(batchId, 3000).catch(() => ({ normalized: [], monthly: [], trialBalance: [] }))));
+    const chunks = await Promise.all(ids.map((batchId) => loadImportBatchRows(batchId, 10000).catch(() => ({ normalized: [], monthly: [], trialBalance: [] }))));
     return chunks.reduce((acc, chunk) => ({
       normalized: [...acc.normalized, ...(chunk.normalized || [])],
       monthly: [...acc.monthly, ...(chunk.monthly || [])],
@@ -2058,11 +2066,14 @@ function ExportCenterPage({ companies, store, importHistory, currentCompanyId, c
     if (!selectedCompany?.id) return;
     setStatus({ loading:true, error:"", ok:"" });
     try {
-      const { exportFinancialExcel } = await import("./lib/exportExcel.js");
+      const { exportFinancialExcel, previewFinancialExcelExport } = await import("./lib/exportExcel.js");
       let exportStore = store;
       let exportBatches = latestBatchesForYears;
       let exportYears = yearsToExport;
       let mode = "latest";
+      if (sourceMode === "latest" && !exportBatches.length) {
+        throw new Error(th ? "ไม่พบงบประจำปี FY ที่ confirmed สำหรับช่วงปี/งบที่เลือก" : "No confirmed FY annual batches were found for the selected company/year range/scope.");
+      }
       if (sourceMode === "batch") {
         if (!selectedBatch?.id) throw new Error(th ? "กรุณาเลือกไฟล์/BATCH ก่อน Export" : "Please select a batch before export.");
         const snapshot = isSupabaseConfigured ? await loadFinancialDataSnapshot(selectedBatch.id) : null;
@@ -2074,20 +2085,45 @@ function ExportCenterPage({ companies, store, importHistory, currentCompanyId, c
       const raw = await loadRowsForBatches(exportBatches);
       const mappingRows = isSupabaseConfigured ? await loadMappingReviewRows(selectedCompany.id, 1000).catch(() => []) : [];
       const filteredMappingRows = mappingRows.filter((row) => !exportYears.length || exportYears.includes(Number(row.fiscal_year)));
-      const fileName = exportFinancialExcel({
+      const exportOptions = {
         company: selectedCompany,
         companyId: selectedCompany.id,
         store: exportStore,
         years: exportYears,
         importBatches: exportBatches,
-        rawRows: [...raw.normalized, ...raw.monthly, ...raw.trialBalance],
+        normalizedRows: raw.normalized,
+        monthlyRows: raw.monthly,
+        trialBalanceRows: raw.trialBalance,
+        rawRows: includeRaw ? [...raw.normalized, ...raw.monthly, ...raw.trialBalance] : [],
         mappingRows: filteredMappingRows,
         language: lang,
         labelMode,
         unit,
         mode,
-      });
-      setStatus({ loading:false, error:"", ok: th ? `สร้างไฟล์แล้ว: ${fileName}` : `Exported: ${fileName}` });
+        strictAnnual: true,
+      };
+      const preview = previewFinancialExcelExport(exportOptions);
+      const integrity = preview?.integrity || {};
+      if (integrity.hasIntegrityIssue || integrity.hasImportantReview) {
+        const proceed = window.confirm(th
+          ? "พบ Warning ก่อน Export เช่น งบไม่สมดุล / ไม่มี FY / ยังมี Mapping Review ต้องการ Export anyway หรือไม่?"
+          : "Warnings were found before export, such as imbalanced statements / missing FY / mapping review items. Export anyway?"
+        );
+        if (!proceed) {
+          setStatus({ loading:false, error:"", ok: th ? "ยกเลิก Export เพื่อให้ตรวจข้อมูลก่อน" : "Export cancelled so the data can be reviewed first." });
+          return;
+        }
+      }
+      const result = exportFinancialExcel(exportOptions);
+      const fileName = result?.fileName || result;
+      const resultIntegrity = result?.integrity || {};
+      let okMsg = th ? `สร้างไฟล์แล้ว: ${fileName}` : `Exported: ${fileName}`;
+      if (resultIntegrity.hasIntegrityIssue) {
+        okMsg += th
+          ? " — ⚠ พบงบที่ไม่สมดุล โปรดตรวจ Sheet ตรวจสอบงบ ก่อนใช้ตัวเลข"
+          : " — ⚠ Statement imbalance found. Review the Integrity Checks sheet before using these figures.";
+      }
+      setStatus({ loading:false, error:"", ok: okMsg });
     } catch (error) {
       setStatus({ loading:false, error:error.message || String(error), ok:"" });
     }
@@ -2116,6 +2152,7 @@ function ExportCenterPage({ companies, store, importHistory, currentCompanyId, c
           <div style={{display:"grid",gridTemplateColumns:"repeat(2,minmax(0,1fr))",gap:14}}>
             <div><div style={labelStyle}>{th ? "บริษัท" : "Company"}</div><select value={selectedCompanyId} onChange={(e)=>{ setSelectedCompanyId(Number(e.target.value)); setSelectedBatchId(""); }} style={selectStyle}>{companies.map((company)=><option key={company.id} value={company.id}>{company.tickerSymbol ? `${company.tickerSymbol} — ` : ""}{th ? company.nameTh : company.nameEn}</option>)}</select></div>
             <div><div style={labelStyle}>{th ? "แหล่งข้อมูล" : "Source mode"}</div><select value={sourceMode} onChange={(e)=>setSourceMode(e.target.value)} style={selectStyle}><option value="latest">{th ? "Latest confirmed หลายปี" : "Latest confirmed by year"}</option><option value="batch">{th ? "เลือกไฟล์/BATCH ย้อนหลัง" : "Historical batch / snapshot"}</option></select></div>
+            {sourceMode === "latest" ? <div><div style={labelStyle}>{th ? "ขอบเขตงบ" : "Statement scope"}</div><select value={statementScope} onChange={(e)=>setStatementScope(e.target.value)} style={selectStyle}><option value="consolidated">{th ? "งบรวม / Consolidated" : "Consolidated"}</option><option value="separate">{th ? "งบเฉพาะกิจการ / Separate" : "Separate"}</option><option value="all">{th ? "ทุก scope (ใช้เฉพาะตรวจสอบ)" : "All scopes (review only)"}</option></select></div> : null}
 
             {sourceMode === "latest" ? <>
               <div><div style={labelStyle}>{th ? "ปีเริ่มต้น" : "Start year"}</div><select value={startYear} onChange={(e)=>setStartYear(Number(e.target.value))} style={selectStyle}>{companyYears.map((year)=><option key={year} value={year}>{year} (พ.ศ.{year+543})</option>)}</select></div>
@@ -2132,6 +2169,7 @@ function ExportCenterPage({ companies, store, importHistory, currentCompanyId, c
           </label>
 
           {reviewCount ? <div style={{marginTop:14,padding:12,borderRadius:10,background:C.amberLo,color:C.amber,fontSize:13,lineHeight:1.6,fontWeight:800}}>⚠ {th ? "ยังมีรายการ Mapping ที่ต้อง Review ไฟล์ Export จะใส่ Warning และ Sheet Mapping Review ให้ตรวจต่อ" : "Some mappings still need review. The export will include a warning and Mapping Review sheet."}</div> : null}
+          {sourceMode === 'latest' && !latestBatchesForYears.length ? <div style={{marginTop:14,padding:12,borderRadius:10,background:C.redLo,color:C.red,fontSize:13,lineHeight:1.6,fontWeight:800}}>⚠ {th ? "ไม่พบ batch งบประจำปี FY ที่ confirmed ตามช่วงปี/scope ที่เลือก Export จะถูกบล็อกเพื่อกันการเอางบ Q/M มาแทนงบปี" : "No confirmed FY annual batch was found for the selected year range/scope. Export is blocked to avoid using Q/M data as annual statements."}</div> : null}
           {status.error ? <div style={{marginTop:14,color:C.red,fontWeight:800}}>{status.error}</div> : null}
           {status.ok ? <div style={{marginTop:14,color:C.green,fontWeight:800}}>{status.ok}</div> : null}
 
@@ -2146,6 +2184,7 @@ function ExportCenterPage({ companies, store, importHistory, currentCompanyId, c
             <div><div style={labelStyle}>{th ? "บริษัท" : "Company"}</div><div style={{fontWeight:900}}>{selectedCompany.tickerSymbol || selectedCompany.id} — {th ? selectedCompany.nameTh : selectedCompany.nameEn}</div></div>
             <div><div style={labelStyle}>{th ? "ปี" : "Years"}</div><div style={{fontWeight:900}}>{sourceMode === "latest" ? yearsToExport.join(", ") || "-" : selectedBatch?.fiscal_year || "-"}</div></div>
             <div><div style={labelStyle}>{th ? "แถว / Review" : "Rows / Review"}</div><div style={{fontWeight:950,color:reviewCount?C.amber:C.green}}>{rowCount.toLocaleString()} / {reviewCount.toLocaleString()}</div></div>
+            <div><div style={labelStyle}>{th ? "คุณภาพข้อมูล" : "Data quality"}</div><div style={{fontWeight:950,color:(()=>{const q=rowCount?Math.round((1-reviewCount/rowCount)*100):100;return q>=95?C.green:q>=80?C.amber:C.red;})()}}>{rowCount?Math.round((1-reviewCount/rowCount)*100):100}% {th?"พร้อมใช้":"clean"}</div></div>
             <div><div style={labelStyle}>{th ? "ไฟล์ที่จะใช้" : "Source files"}</div><div style={{color:C.muted,lineHeight:1.55}}>{sourceMode === "latest" ? (latestBatchesForYears.map((row)=>`${row.fiscal_year}: ${row.file_name}`).join("\n") || "-") : (selectedBatch?.file_name || "-")}</div></div>
           </div>
         </Card>

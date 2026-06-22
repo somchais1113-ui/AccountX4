@@ -315,3 +315,15 @@ Required previous migrations:
 ```
 
 After deploying v1.7.7, open the new **ส่งออก Excel / Excel Export** menu. The export file includes financial statement sheets, ratios, mapping review rows, raw normalized rows, and import lineage. If mappings still need review, the workbook cover sheet will contain a warning.
+
+## v1.7.9 Migration Note
+
+After deploying v1.7.9, run this optional-but-recommended hardening migration in Supabase SQL Editor:
+
+```text
+supabase/migrations/202606230002_export_security_hardening.sql
+```
+
+This migration is idempotent and does not delete data. It re-enables RLS on `alert_events` and `line_alert_settings` and re-scopes policies by `company_members`.
+
+Do not run any `pg_cron` / LINE scheduled alert migration yet. Scheduled LINE dispatch is intentionally paused until the alert workflow is ready.
