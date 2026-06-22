@@ -274,3 +274,20 @@ Thai headers are also supported, for example:
 4000,รายได้จากการขาย,0,12000000,12000000
 5000,ต้นทุนขาย,7500000,0,7500000
 ```
+
+## v1.6 Data Governance Pack
+
+Adds Import History / Data Lineage, rollback-safe import statuses, raw file metadata, Data Quality checks, and Account Mapping Center.
+
+Run the new migration after v1.5 migrations:
+
+```sql
+supabase/migrations/202606220003_data_governance_pack.sql
+```
+
+New UI pages:
+- Import History: trace imported files, batch status, source file metadata, parsed rows, and rollback an import.
+- Data Quality: accounting checks such as Assets ≈ Liabilities + Equity.
+- Mapping Center: review low-confidence mappings and persist corrected account groups.
+
+If Supabase Storage bucket creation is restricted in your environment, imports still work; raw file download will be unavailable until the `raw-financial-files` bucket is created.

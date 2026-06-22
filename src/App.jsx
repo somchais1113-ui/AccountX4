@@ -11,6 +11,8 @@ import {
   isSupabaseConfigured, supabase, signIn, signUp, resetPassword, signOut,
   loadCompanies, createCompany, updateCompany, loadAllFinancialData, saveImportBatch, savePrivateImportBatch, loadExchangeRates, saveExchangeRate,
   loadAuditLog, loadCompanyMembers, grantCompanyAccess, revokeCompanyAccess,
+  loadImportHistory, loadImportBatchRows, rollbackImportBatch, getRawFileSignedUrl,
+  loadMappingReviewRows, updateMappingForRawAccount,
 } from "./lib/supabase.js";
 import ImportWizard from "./components/ImportWizard";
 import MomentumDashboard from "./components/Dashboard";
@@ -1556,6 +1558,208 @@ function AuditPage({lang}) {
   );
 }
 
+
+function ImportHistoryPage({ companyId, companies, onRefresh, lang }) {
+  const C = useC();
+  const th = lang === "th";
+  const [rows, setRows] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [details, setDetails] = useState(null);
+  const [status, setStatus] = useState({ loading: true, error: "" });
+  const [busy, setBusy] = useState(false);
+
+  const load = async () => {
+    if (!isSupabaseConfigured) { setStatus({ loading: false, error: th ? "ต้องเชื่อม Supabase ก่อน" : "Supabase is required" }); return; }
+    setStatus({ loading: true, error: "" });
+    try {
+      const data = await loadImportHistory(companyId || null, 300);
+      setRows(data);
+      setStatus({ loading: false, error: "" });
+    } catch (error) {
+      setStatus({ loading: false, error: error.message });
+    }
+  };
+  useEffect(() => { load(); }, [companyId, lang]);
+
+  const openDetails = async (row) => {
+    setSelected(row);
+    setDetails(null);
+    try { setDetails(await loadImportBatchRows(row.id)); }
+    catch (error) { setDetails({ error: error.message, normalized: [], monthly: [], trialBalance: [] }); }
+  };
+
+  const rollback = async (row) => {
+    if (!window.confirm(th ? `ยืนยัน rollback ไฟล์ ${row.file_name}?` : `Rollback ${row.file_name}?`)) return;
+    setBusy(true);
+    try {
+      await rollbackImportBatch(row.id);
+      await onRefresh?.();
+      await load();
+      if (selected?.id === row.id) setSelected(null);
+    } catch (error) { alert(error.message); }
+    finally { setBusy(false); }
+  };
+
+  const downloadRaw = async (row) => {
+    if (!row.storage_path) return;
+    const url = await getRawFileSignedUrl(row.storage_path);
+    if (url) window.open(url, "_blank");
+  };
+
+  const statusColor = (status) => status === 'confirmed' ? C.green : status === 'rolled_back' ? C.red : status === 'superseded' ? C.amber : C.muted;
+  const formatSize = (bytes) => bytes ? `${(Number(bytes) / 1024 / 1024).toFixed(2)} MB` : "-";
+
+  return (
+    <div>
+      <PageHeader title={th ? "ประวัติการนำเข้า" : "Import History"} subtitle={th ? "ตรวจย้อนกลับไฟล์ที่อัปโหลด ใครอัป เมื่อไหร่ และข้อมูลเข้า batch ไหน" : "Trace uploaded files, batches, rows, and rollback status"}/>
+      <div className="responsive-grid-3" style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:16}}>
+        <Card style={{padding:16}}><div style={{fontSize:12,color:C.muted,fontWeight:800}}>{th?"จำนวน Import":"Imports"}</div><div style={{fontSize:24,fontWeight:900}}>{rows.length}</div></Card>
+        <Card style={{padding:16}}><div style={{fontSize:12,color:C.muted,fontWeight:800}}>{th?"Active/Confirmed":"Active/Confirmed"}</div><div style={{fontSize:24,fontWeight:900,color:C.green}}>{rows.filter(r=>r.status==='confirmed').length}</div></Card>
+        <Card style={{padding:16}}><div style={{fontSize:12,color:C.muted,fontWeight:800}}>{th?"มีไฟล์ต้นฉบับ":"Raw files"}</div><div style={{fontSize:24,fontWeight:900,color:C.blue}}>{rows.filter(r=>r.storage_path).length}</div></Card>
+      </div>
+      <Card style={{padding:0,overflow:"hidden"}}>
+        {status.loading ? <div style={{padding:20}}>{th?"กำลังโหลด...":"Loading..."}</div> : status.error ? <div style={{padding:20,color:C.red}}>{status.error}</div> : (
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:1100}}>
+              <thead><tr>{[th?"เวลา":"Time",th?"บริษัท":"Company",th?"ไฟล์":"File",th?"ปี":"Year",th?"ประเภท":"Type",th?"แถว":"Rows",th?"Review":"Review",th?"สถานะ":"Status",th?"ไฟล์ดิบ":"Raw",th?"จัดการ":"Actions"].map(h=><th key={h} style={{textAlign:"left",padding:11,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
+              <tbody>{rows.map(row => (
+                <tr key={row.id} style={{borderBottom:`1px solid ${C.border}`}}>
+                  <td style={{padding:11,color:C.muted}}>{row.imported_at ? new Date(row.imported_at).toLocaleString(th?"th-TH":"en-GB") : "-"}</td>
+                  <td style={{padding:11,fontWeight:800}}>{row.companies?.ticker_symbol || row.companies?.name_th || row.company_id}</td>
+                  <td style={{padding:11,maxWidth:260,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}} title={row.file_name}>{row.file_name}</td>
+                  <td style={{padding:11}}>{row.fiscal_year || "-"}</td>
+                  <td style={{padding:11,color:C.muted}}>{row.source_type || row.period_type || "-"}</td>
+                  <td style={{padding:11,textAlign:"right"}}>{Number(row.total_rows || 0).toLocaleString()}</td>
+                  <td style={{padding:11,textAlign:"right",color:Number(row.review_count)>0?C.amber:C.green}}>{row.review_count ?? 0}</td>
+                  <td style={{padding:11}}><Badge color={statusColor(row.status)}>{row.status || "confirmed"}</Badge></td>
+                  <td style={{padding:11}}>{row.storage_path ? <button onClick={()=>downloadRaw(row)} style={{border:"none",background:C.blueLo,color:C.blue,borderRadius:8,padding:"7px 9px",cursor:"pointer"}}>{formatSize(row.file_size)}</button> : <span style={{color:C.muted}}>-</span>}</td>
+                  <td style={{padding:11,display:"flex",gap:8}}>
+                    <button onClick={()=>openDetails(row)} style={{border:"none",background:C.accentLo,color:C.accent,borderRadius:8,padding:"7px 10px",cursor:"pointer"}}>{th?"ดู":"View"}</button>
+                    {row.status === 'confirmed' && <button disabled={busy} onClick={()=>rollback(row)} style={{border:"none",background:C.redLo,color:C.red,borderRadius:8,padding:"7px 10px",cursor:busy?"wait":"pointer"}}>{th?"Rollback":"Rollback"}</button>}
+                  </td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+      {selected && (
+        <Card style={{marginTop:16}}>
+          <div style={{display:"flex",justifyContent:"space-between",gap:12,alignItems:"flex-start",marginBottom:12}}>
+            <div><div style={{fontSize:18,fontWeight:900}}>{selected.file_name}</div><div style={{fontSize:12,color:C.muted}}>{selected.id}</div></div>
+            <Badge color={statusColor(selected.status)}>{selected.status}</Badge>
+          </div>
+          {!details ? <div style={{color:C.muted}}>{th?"กำลังโหลดรายละเอียด...":"Loading details..."}</div> : details.error ? <div style={{color:C.red}}>{details.error}</div> : (
+            <>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:14}}>
+                <div style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:10,padding:12}}><b>{details.normalized.length}</b><div style={{fontSize:12,color:C.muted}}>normalized rows</div></div>
+                <div style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:10,padding:12}}><b>{details.monthly.length}</b><div style={{fontSize:12,color:C.muted}}>monthly rows</div></div>
+                <div style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:10,padding:12}}><b>{details.trialBalance.length}</b><div style={{fontSize:12,color:C.muted}}>trial balance rows</div></div>
+              </div>
+              <div style={{overflowX:"auto",maxHeight:360}}>
+                <table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:800}}>
+                  <thead><tr>{["Year","Statement","Raw Account","Group","Amount","Source"].map(h=><th key={h} style={{textAlign:"left",padding:8,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
+                  <tbody>{details.normalized.slice(0,120).map(row=><tr key={row.id}><td style={{padding:8}}>{row.fiscal_year}</td><td style={{padding:8}}>{row.statement_type}</td><td style={{padding:8}}>{row.raw_account_name}</td><td style={{padding:8}}>{row.account_group}</td><td style={{padding:8,textAlign:"right"}}>{Number(row.amount||0).toLocaleString()}</td><td style={{padding:8,color:C.muted}}>{row.source_sheet}:{row.source_row}</td></tr>)}</tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+function DataQualityPage({ store, companyId, lang }) {
+  const C = useC();
+  const th = lang === "th";
+  const company = COMPANIES.find(c=>c.id===companyId);
+  const annualRows = DataEngine.getAnnualRows(store, companyId);
+  const validations = annualRows.map(row => {
+    const balanceDiff = Math.abs((row.liability + row.equity) - row.asset);
+    const balanceBase = Math.max(Math.abs(row.asset), 1);
+    const balanceOk = balanceDiff / balanceBase < 0.01;
+    const marginOk = !row.revenue || Math.abs(row.margin) < 100;
+    const cfoOk = Number.isFinite(row.operatingCashFlow);
+    return { year: row.year, balanceDiff, balanceOk, marginOk, cfoOk, pass: [balanceOk, marginOk, cfoOk].filter(Boolean).length, total: 3, row };
+  });
+  const totalPass = validations.reduce((s,v)=>s+v.pass,0);
+  const totalChecks = validations.reduce((s,v)=>s+v.total,0);
+  const score = totalChecks ? Math.round((totalPass/totalChecks)*100) : 0;
+  const color = score >= 90 ? C.green : score >= 70 ? C.amber : C.red;
+  return (
+    <div>
+      <PageHeader title={th?"คุณภาพข้อมูล":"Data Quality"} subtitle={th?"ตรวจสมการงบและความสมเหตุสมผลก่อนใช้วิเคราะห์":"Accounting validation checks before analysis"}/>
+      <div className="responsive-grid-3" style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:16}}>
+        <Card><div style={{fontSize:12,color:C.muted,fontWeight:800}}>Data Quality Score</div><div style={{fontSize:30,fontWeight:900,color}}>{score}%</div></Card>
+        <Card><div style={{fontSize:12,color:C.muted,fontWeight:800}}>{th?"ปีที่ตรวจ":"Years checked"}</div><div style={{fontSize:30,fontWeight:900}}>{validations.length}</div></Card>
+        <Card><div style={{fontSize:12,color:C.muted,fontWeight:800}}>{th?"บริษัท":"Company"}</div><div style={{fontSize:16,fontWeight:900}}>{company?.tickerSymbol || company?.nameTh || '-'}</div></Card>
+      </div>
+      <Card style={{padding:0,overflow:"hidden"}}>
+        <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:900}}>
+            <thead><tr>{[th?"ปี":"Year","Balance Sheet","Net Margin","Cash Flow","Diff"].map(h=><th key={h} style={{textAlign:"left",padding:12,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
+            <tbody>{validations.map(v=><tr key={v.year} style={{borderBottom:`1px solid ${C.border}`}}>
+              <td style={{padding:12,fontWeight:900}}>FY {v.year}</td>
+              <td style={{padding:12,color:v.balanceOk?C.green:C.red}}>{v.balanceOk?"✓":"⚠"} {th?"สินทรัพย์ = หนี้สิน + ทุน":"Assets = Liabilities + Equity"}</td>
+              <td style={{padding:12,color:v.marginOk?C.green:C.amber}}>{v.marginOk?"✓":"⚠"} {v.row.margin.toFixed(1)}%</td>
+              <td style={{padding:12,color:v.cfoOk?C.green:C.red}}>{v.cfoOk?"✓":"⚠"} CFO</td>
+              <td style={{padding:12,textAlign:"right"}}>{fmt(v.balanceDiff, company?.currency || 'THB', true)}</td>
+            </tr>)}</tbody>
+          </table>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function MappingCenterPage({ companyId, lang, onRefresh }) {
+  const C = useC();
+  const th = lang === "th";
+  const [rows, setRows] = useState([]);
+  const [status, setStatus] = useState({loading:true,error:""});
+  const [savingId, setSavingId] = useState(null);
+  const groupOptions = Object.keys(METRIC_GROUPS).concat(['gross_profit','other_income','other_current_assets','other_current_liabilities','other']).sort();
+  const load = async () => {
+    if (!isSupabaseConfigured) { setStatus({loading:false,error:th?"ต้องเชื่อม Supabase ก่อน":"Supabase is required"}); return; }
+    setStatus({loading:true,error:""});
+    try { setRows(await loadMappingReviewRows(companyId, 500)); setStatus({loading:false,error:""}); }
+    catch(error){ setStatus({loading:false,error:error.message}); }
+  };
+  useEffect(()=>{ load(); },[companyId,lang]);
+  const save = async (row, group) => {
+    setSavingId(row.id);
+    try {
+      await updateMappingForRawAccount({ companyId: row.company_id, rawAccountName: row.raw_account_name, statementType: row.statement_type, accountGroup: group });
+      await load(); await onRefresh?.();
+    } catch(error) { alert(error.message); }
+    finally { setSavingId(null); }
+  };
+  return (
+    <div>
+      <PageHeader title={th?"Account Mapping Center":"Account Mapping Center"} subtitle={th?"จัดการรายการบัญชีที่ระบบยังไม่มั่นใจ และจำ mapping ไว้ใช้ครั้งต่อไป":"Review low-confidence mappings and persist them for future imports"}/>
+      <Card style={{padding:0,overflow:"hidden"}}>
+        {status.loading ? <div style={{padding:20}}>{th?"กำลังโหลด...":"Loading..."}</div> : status.error ? <div style={{padding:20,color:C.red}}>{status.error}</div> : rows.length === 0 ? <div style={{padding:24,textAlign:"center",color:C.green,fontWeight:900}}>{th?"ไม่มีรายการที่ต้องแก้ไข":"No mapping issues found"}</div> : (
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:980}}>
+              <thead><tr>{[th?"บริษัท":"Company",th?"ปี":"Year",th?"งบ":"Statement",th?"ชื่อบัญชีจากไฟล์":"Raw account",th?"กลุ่มปัจจุบัน":"Current group",th?"Confidence":"Confidence",th?"แก้เป็น":"Map to"].map(h=><th key={h} style={{textAlign:"left",padding:11,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
+              <tbody>{rows.map(row => <tr key={row.id} style={{borderBottom:`1px solid ${C.border}`}}>
+                <td style={{padding:11}}>{row.companies?.ticker_symbol || row.company_id}</td>
+                <td style={{padding:11}}>{row.fiscal_year}</td>
+                <td style={{padding:11,color:C.muted}}>{row.statement_type}</td>
+                <td style={{padding:11,fontWeight:700}}>{row.raw_account_name}</td>
+                <td style={{padding:11}}><Badge color={row.account_group === 'other' ? C.amber : C.accent}>{row.account_group}</Badge></td>
+                <td style={{padding:11,color:(Number(row.mapping_confidence)||0) >= 0.9 ? C.green : C.amber}}>{row.mapping_confidence ?? '-'}</td>
+                <td style={{padding:11}}><select disabled={savingId===row.id} value={row.account_group || 'other'} onChange={(e)=>save(row,e.target.value)} style={{background:C.bg,border:`1px solid ${C.border}`,color:C.text,borderRadius:8,padding:"8px 10px",minWidth:180}}>{groupOptions.map(g=><option key={g} value={g}>{g}</option>)}</select></td>
+              </tr>)}</tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
 function BackupPage({companies,store,exchangeRates,onImport,lang}) {
   const C = useC();
   const th = lang==="th";
@@ -1594,6 +1798,9 @@ const NAV = [
   {id:"consolidation", icon:"⊞", th:"งบรวม", en:"Consolidation"},
   {id:"slides", icon:"🖥", th:"Slide Template", en:"Slide Template"},
   {id:"access", icon:"🔐", th:"สิทธิ์ผู้ใช้", en:"Access"},
+  {id:"imports", icon:"🧭", th:"ประวัตินำเข้า", en:"Import History"},
+  {id:"quality", icon:"✅", th:"คุณภาพข้อมูล", en:"Data Quality"},
+  {id:"mapping", icon:"🧩", th:"Mapping", en:"Mapping"},
   {id:"audit", icon:"🧾", th:"Audit Log", en:"Audit Log"},
   {id:"backup", icon:"💾", th:"สำรองข้อมูล", en:"Backup"},
 ];
@@ -1802,6 +2009,9 @@ export default function App() {
     if (page==="consolidation") return <ConsolidationPage store={store} year={year} lang={lang} exchangeRates={exchangeRates} onSaveRate={handleSaveRate}/>;
     if (page==="slides") return <SlideViewer store={store} companyId={companyId} year={year} lang={lang} theme={theme} onImportSuccess={handleUpsert} onGoUpload={()=>setPage("upload")}/>;
     if (page==="access") return <AccessPage companyId={companyId} lang={lang}/>;
+    if (page==="imports") return <ImportHistoryPage companyId={companyId} companies={companies} onRefresh={refreshRemoteData} lang={lang}/>;
+    if (page==="quality") return <DataQualityPage store={store} companyId={companyId} lang={lang}/>;
+    if (page==="mapping") return <MappingCenterPage companyId={companyId} lang={lang} onRefresh={refreshRemoteData}/>;
     if (page==="audit") return <AuditPage lang={lang}/>;
     if (page==="backup") return <BackupPage companies={companies} store={store} exchangeRates={exchangeRates} onImport={handleBackupImport} lang={lang}/>;
   };

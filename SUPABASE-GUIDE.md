@@ -153,3 +153,25 @@ supabase/migrations/202606220002_legal_entity_type.sql
 - `limited_partnership` = ห้างหุ้นส่วนจำกัด
 
 Migration นี้ safe rerun ได้ และมี `notify pgrst, 'reload schema';` ให้แล้ว
+
+## v1.6 Migration: Data Governance Pack
+
+Run after v1.5.3 legal entity migration:
+
+```sql
+supabase/migrations/202606220003_data_governance_pack.sql
+```
+
+This adds:
+- `import_batches.file_hash`, `file_size`, `storage_path`, `total_rows`, `review_count`, `validation_summary`
+- import lifecycle statuses: `confirmed`, `superseded`, `rolled_back`
+- Supabase Storage bucket `raw-financial-files`
+- storage policies for company members
+
+Recommended check:
+
+```sql
+select id, file_name, status, total_rows, review_count, storage_path, imported_at
+from public.import_batches
+order by imported_at desc;
+```

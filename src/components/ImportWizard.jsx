@@ -28,6 +28,14 @@ function sourceToParserType(sourceType) {
   return 'auto';
 }
 
+
+async function sha256File(file) {
+  if (!file || !window.crypto?.subtle) return null;
+  const buffer = await file.arrayBuffer();
+  const digest = await window.crypto.subtle.digest('SHA-256', buffer);
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 export default function ImportWizard({ companyId, company, onImportSuccess, lang, theme, C }) {
   const th = lang === 'th';
   const [legalEntityType, setLegalEntityType] = useState(getDefaultLegalEntityType(company));
@@ -65,7 +73,8 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
     if (!file) return;
     setStatus({ type: 'loading', msg: th ? 'กำลังวิเคราะห์โครงสร้างไฟล์...' : 'Analyzing file structure...' });
     try {
-      setBatchDetails(prev => ({ ...prev, fileName: file.name, sourceType }));
+      const fileHash = await sha256File(file);
+      setBatchDetails(prev => ({ ...prev, fileName: file.name, sourceType, rawFile: file, fileSize: file.size, fileHash }));
 
       if (sourceType === 'public_financial_statement') {
         const rows = await parseFinancialFile(file, companyId);
@@ -76,7 +85,7 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
           return;
         }
         const primaryYear = summary?.primaryYear || rows[0].fiscal_year;
-        setBatchDetails(prev => ({ ...prev, fiscalYear: primaryYear, periodType: 'annual', period: 'FY', statementScope: rows[0].statement_scope || 'consolidated', sourceType, legalEntityType, parserProfile: summary?.parserVersion || 'IMPORT_PARSER_V3_INDUSTRY_PACK_V1' }));
+        setBatchDetails(prev => ({ ...prev, fiscalYear: primaryYear, periodType: 'annual', period: 'FY', statementScope: rows[0].statement_scope || 'consolidated', sourceType, legalEntityType, parserProfile: summary?.parserVersion || 'IMPORT_PARSER_V3_INDUSTRY_PACK_V1', reviewCount: summary?.reviewCount || 0 }));
         setPrivatePayload(null);
         setParseSummary(summary);
         setParsedData(rows);
@@ -126,6 +135,7 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
         sourceType,
         legalEntityType,
         parserProfile: summary.parserVersion || 'PRIVATE_COMPANY_IMPORT_PACK_V1',
+        reviewCount: summary.reviewCount || 0,
       }));
       setPrivatePayload(payload);
       setParsedData(previewRows);

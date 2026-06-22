@@ -148,7 +148,12 @@ export async function updateCompany(id, company) {
 }
 
 export async function loadAllNormalizedData() {
-  const { data, error } = await requireClient().from("normalized_financial_data").select("*").order("fiscal_year").order("period");
+  const { data, error } = await requireClient()
+    .from("normalized_financial_data")
+    .select("*")
+    .eq("import_status", "confirmed")
+    .order("fiscal_year")
+    .order("period");
   if (error) throw error;
   
   // Transform flat rows into a hierarchical store for the dashboard
@@ -178,6 +183,7 @@ export async function loadAllMonthlyOperatingData() {
   const { data, error } = await client
     .from("monthly_operating_data")
     .select("*")
+    .eq("import_status", "confirmed")
     .order("fiscal_year")
     .order("month");
   if (error) {
@@ -247,6 +253,65 @@ async function insertInChunks(client, table, rows, chunkSize = 500) {
   return inserted;
 }
 
+async function updateIfSupported(queryFactory, fallbackDeleteFactory = null) {
+  const { error } = await queryFactory();
+  if (!error) return true;
+  if (/import_status|status|check constraint|violates check|schema cache|Could not find/i.test(error.message || '') && fallbackDeleteFactory) {
+    const fallback = await fallbackDeleteFactory();
+    if (fallback.error) throw normalizeSupabaseError(fallback.error);
+    return false;
+  }
+  throw normalizeSupabaseError(error);
+}
+
+async function uploadRawFileForBatch(client, companyId, batchId, batchDetails = {}) {
+  const file = batchDetails.rawFile;
+  if (!file || typeof client.storage?.from !== 'function') return null;
+  const safeName = String(file.name || batchDetails.fileName || 'upload.bin').replace(/[^a-zA-Z0-9._-]+/g, '_');
+  const path = `${companyId}/${batchId}/${safeName}`;
+  try {
+    const { error: uploadError } = await client.storage
+      .from('raw-financial-files')
+      .upload(path, file, { upsert: true, contentType: file.type || 'application/octet-stream' });
+    if (uploadError) return null;
+    await client.from('import_batches').update({
+      storage_path: path,
+      file_size: Number(file.size) || null,
+      file_hash: batchDetails.fileHash || null,
+    }).eq('id', batchId);
+    return path;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function upsertAccountMappings(client, companyId, rows = []) {
+  const seen = new Set();
+  const mappings = rows
+    .filter(row => row.raw_account_name && row.statement_type && row.account_group)
+    .map(row => {
+      const key = `${row.statement_type}|${row.raw_account_name}`;
+      if (seen.has(key)) return null;
+      seen.add(key);
+      return {
+        company_id: companyId,
+        raw_account_name: row.raw_account_name,
+        statement_type: row.statement_type,
+        account_group: row.account_group,
+        account_subgroup: row.account_subgroup || null,
+        industry_metric: row.industry_metric || null,
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 2000);
+  if (!mappings.length) return;
+  try {
+    await client.from('account_mappings').upsert(mappings, { onConflict: 'company_id,raw_account_name,statement_type' });
+  } catch (_) {
+    // Mapping persistence is helpful but should not block imports.
+  }
+}
+
 export async function saveImportBatch(companyId, batchDetails, normalizedDataRows) {
   const client = requireClient();
   const safeRows = Array.isArray(normalizedDataRows) ? normalizedDataRows : [];
@@ -263,11 +328,15 @@ export async function saveImportBatch(companyId, batchDetails, normalizedDataRow
     source_type: batchDetails.sourceType || 'public_financial_statement',
     parser_profile: batchDetails.parserProfile || null,
     legal_entity_type: batchDetails.legalEntityType || null,
+    file_hash: batchDetails.fileHash || null,
+    file_size: batchDetails.fileSize || null,
+    review_count: batchDetails.reviewCount ?? null,
+    total_rows: safeRows.length,
     status: 'confirmed'
   };
   let { data: batch, error: batchError } = await client.from("import_batches").insert(batchPayload).select("id").single();
-  if (batchError && /source_type|parser_profile|legal_entity_type|schema cache|Could not find/i.test(batchError.message || '')) {
-    const { source_type, parser_profile, legal_entity_type, ...fallbackBatchPayload } = batchPayload;
+  if (batchError && /source_type|parser_profile|legal_entity_type|file_hash|file_size|storage_path|total_rows|review_count|schema cache|Could not find/i.test(batchError.message || '')) {
+    const { source_type, parser_profile, legal_entity_type, file_hash, file_size, storage_path, validation_summary, review_count, total_rows, ...fallbackBatchPayload } = batchPayload;
     const fallback = await client.from("import_batches").insert(fallbackBatchPayload).select("id").single();
     batch = fallback.data;
     batchError = fallback.error;
@@ -305,21 +374,31 @@ export async function saveImportBatch(companyId, batchDetails, normalizedDataRow
     import_status: 'confirmed'
   }));
   
-  // Clean old data for every year/period/scope found in this upload.
-  // Real financial statements commonly contain comparative columns, e.g. 2025 and 2024 in one file.
+  // Preserve old rows as superseded when the governance migration is installed.
+  // Fallback to delete for databases that still have the old check constraint.
   const replaceKeys = new Set(payload.map((row) => [row.fiscal_year, row.period || 'FY', row.statement_scope || 'consolidated'].join('|')));
   for (const key of replaceKeys) {
     const [fiscalYear, period, statementScope] = key.split('|');
-    const { error: deleteError } = await client.from("normalized_financial_data")
-      .delete()
-      .eq("company_id", companyId)
-      .eq("fiscal_year", Number(fiscalYear))
-      .eq("period", period)
-      .eq("statement_scope", statementScope);
-    if (deleteError) throw normalizeSupabaseError(deleteError);
+    await updateIfSupported(
+      () => client.from("normalized_financial_data")
+        .update({ import_status: 'superseded' })
+        .eq("company_id", companyId)
+        .eq("fiscal_year", Number(fiscalYear))
+        .eq("period", period)
+        .eq("statement_scope", statementScope)
+        .eq("import_status", 'confirmed'),
+      () => client.from("normalized_financial_data")
+        .delete()
+        .eq("company_id", companyId)
+        .eq("fiscal_year", Number(fiscalYear))
+        .eq("period", period)
+        .eq("statement_scope", statementScope)
+    );
   }
 
   const rowsImported = await insertInChunks(client, "normalized_financial_data", payload);
+  await uploadRawFileForBatch(client, companyId, batch.id, batchDetails);
+  await upsertAccountMappings(client, companyId, safeRows);
   
   return { batchId: batch.id, rowsImported };
 }
@@ -343,11 +422,15 @@ export async function savePrivateImportBatch(companyId, batchDetails, privatePay
     source_type: batchDetails.sourceType || 'private_company_file',
     parser_profile: batchDetails.parserProfile || 'PRIVATE_COMPANY_IMPORT_PACK_V1',
     legal_entity_type: batchDetails.legalEntityType || null,
+    file_hash: batchDetails.fileHash || null,
+    file_size: batchDetails.fileSize || null,
+    total_rows: totalInputRows,
+    review_count: privatePayload.summary?.reviewCount ?? null,
     status: 'confirmed'
   };
   let { data: batch, error: batchError } = await client.from("import_batches").insert(batchPayload).select("id").single();
-  if (batchError && /source_type|parser_profile|legal_entity_type|schema cache|Could not find/i.test(batchError.message || '')) {
-    const { source_type, parser_profile, legal_entity_type, ...fallbackBatchPayload } = batchPayload;
+  if (batchError && /source_type|parser_profile|legal_entity_type|file_hash|file_size|storage_path|total_rows|review_count|schema cache|Could not find/i.test(batchError.message || '')) {
+    const { source_type, parser_profile, legal_entity_type, file_hash, file_size, storage_path, validation_summary, review_count, total_rows, ...fallbackBatchPayload } = batchPayload;
     const fallback = await client.from("import_batches").insert(fallbackBatchPayload).select("id").single();
     batch = fallback.data;
     batchError = fallback.error;
@@ -360,12 +443,19 @@ export async function savePrivateImportBatch(companyId, batchDetails, privatePay
     const deleteKeys = new Set(monthlyRows.map(row => [row.fiscal_year, row.month].join('|')));
     for (const key of deleteKeys) {
       const [fiscalYear, month] = key.split('|');
-      const { error: deleteError } = await client.from("monthly_operating_data")
-        .delete()
-        .eq("company_id", companyId)
-        .eq("fiscal_year", Number(fiscalYear))
-        .eq("month", Number(month));
-      if (deleteError) throw normalizeSupabaseError(deleteError);
+      await updateIfSupported(
+        () => client.from("monthly_operating_data")
+          .update({ import_status: 'superseded' })
+          .eq("company_id", companyId)
+          .eq("fiscal_year", Number(fiscalYear))
+          .eq("month", Number(month))
+          .eq("import_status", 'confirmed'),
+        () => client.from("monthly_operating_data")
+          .delete()
+          .eq("company_id", companyId)
+          .eq("fiscal_year", Number(fiscalYear))
+          .eq("month", Number(month))
+      );
     }
     const payload = monthlyRows.map(row => ({
       company_id: companyId,
@@ -388,11 +478,17 @@ export async function savePrivateImportBatch(companyId, batchDetails, privatePay
   if (trialBalanceRows.length) {
     const deleteYears = new Set(trialBalanceRows.map(row => row.fiscal_year));
     for (const fiscalYear of deleteYears) {
-      const { error: deleteError } = await client.from("trial_balance_data")
-        .delete()
-        .eq("company_id", companyId)
-        .eq("fiscal_year", Number(fiscalYear));
-      if (deleteError) throw normalizeSupabaseError(deleteError);
+      await updateIfSupported(
+        () => client.from("trial_balance_data")
+          .update({ import_status: 'superseded' })
+          .eq("company_id", companyId)
+          .eq("fiscal_year", Number(fiscalYear))
+          .eq("import_status", 'confirmed'),
+        () => client.from("trial_balance_data")
+          .delete()
+          .eq("company_id", companyId)
+          .eq("fiscal_year", Number(fiscalYear))
+      );
     }
     const payload = trialBalanceRows.map(row => ({
       company_id: companyId,
@@ -447,18 +543,141 @@ export async function savePrivateImportBatch(companyId, batchDetails, privatePay
     const replaceKeys = new Set(payload.map((row) => [row.fiscal_year, row.period || 'FY', row.statement_scope || 'private_company'].join('|')));
     for (const key of replaceKeys) {
       const [fiscalYear, period, statementScope] = key.split('|');
-      const { error: deleteError } = await client.from("normalized_financial_data")
-        .delete()
-        .eq("company_id", companyId)
-        .eq("fiscal_year", Number(fiscalYear))
-        .eq("period", period)
-        .eq("statement_scope", statementScope);
-      if (deleteError) throw normalizeSupabaseError(deleteError);
+      await updateIfSupported(
+        () => client.from("normalized_financial_data")
+          .update({ import_status: 'superseded' })
+          .eq("company_id", companyId)
+          .eq("fiscal_year", Number(fiscalYear))
+          .eq("period", period)
+          .eq("statement_scope", statementScope)
+          .eq("import_status", 'confirmed'),
+        () => client.from("normalized_financial_data")
+          .delete()
+          .eq("company_id", companyId)
+          .eq("fiscal_year", Number(fiscalYear))
+          .eq("period", period)
+          .eq("statement_scope", statementScope)
+      );
     }
     rowsImported += await insertInChunks(client, "normalized_financial_data", payload);
   }
 
+  await uploadRawFileForBatch(client, companyId, batch.id, batchDetails);
+  if (normalizedRows.length) await upsertAccountMappings(client, companyId, normalizedRows);
   return { batchId: batch.id, rowsImported };
+}
+
+export async function loadImportHistory(companyId = null, limit = 200) {
+  const client = requireClient();
+  let query = client
+    .from('import_batches')
+    .select('id,company_id,file_name,fiscal_year,period_type,period,statement_scope,source_type,parser_profile,legal_entity_type,status,total_rows,review_count,file_hash,file_size,storage_path,imported_at,companies(name_th,name_en,ticker_symbol,industry,currency)')
+    .order('imported_at', { ascending: false })
+    .limit(limit);
+  if (companyId) query = query.eq('company_id', companyId);
+  let { data, error } = await query;
+  if (error && /source_type|parser_profile|legal_entity_type|file_hash|file_size|storage_path|total_rows|review_count|schema cache|Could not find/i.test(error.message || '')) {
+    let fallback = client
+      .from('import_batches')
+      .select('id,company_id,file_name,fiscal_year,period_type,period,statement_scope,status,imported_at,companies(name_th,name_en,ticker_symbol,industry,currency)')
+      .order('imported_at', { ascending: false })
+      .limit(limit);
+    if (companyId) fallback = fallback.eq('company_id', companyId);
+    const res = await fallback;
+    data = res.data;
+    error = res.error;
+  }
+  if (error) throw normalizeSupabaseError(error);
+  return data || [];
+}
+
+export async function loadImportBatchRows(batchId, limit = 500) {
+  const client = requireClient();
+  const [normalized, monthly, trial] = await Promise.all([
+    client.from('normalized_financial_data').select('*').eq('import_batch_id', batchId).limit(limit),
+    client.from('monthly_operating_data').select('*').eq('import_batch_id', batchId).limit(limit),
+    client.from('trial_balance_data').select('*').eq('import_batch_id', batchId).limit(limit),
+  ]);
+  const safe = (res) => res.error ? [] : (res.data || []);
+  return {
+    normalized: safe(normalized),
+    monthly: safe(monthly),
+    trialBalance: safe(trial),
+  };
+}
+
+export async function rollbackImportBatch(batchId) {
+  const client = requireClient();
+  const { data: batch, error: batchError } = await client.from('import_batches').select('*').eq('id', batchId).single();
+  if (batchError) throw normalizeSupabaseError(batchError);
+
+  await Promise.all([
+    client.from('normalized_financial_data').update({ import_status: 'rolled_back' }).eq('import_batch_id', batchId),
+    client.from('monthly_operating_data').update({ import_status: 'rolled_back' }).eq('import_batch_id', batchId),
+    client.from('trial_balance_data').update({ import_status: 'rolled_back' }).eq('import_batch_id', batchId),
+  ]);
+  await client.from('import_batches').update({ status: 'rolled_back' }).eq('id', batchId);
+
+  // Best-effort restore the most recent superseded batch for the same company/year/period.
+  const { data: previous } = await client
+    .from('import_batches')
+    .select('id')
+    .eq('company_id', batch.company_id)
+    .eq('fiscal_year', batch.fiscal_year)
+    .eq('period', batch.period || 'FY')
+    .eq('status', 'superseded')
+    .order('imported_at', { ascending: false })
+    .limit(1);
+  const previousId = previous?.[0]?.id;
+  if (previousId) {
+    await Promise.all([
+      client.from('normalized_financial_data').update({ import_status: 'confirmed' }).eq('import_batch_id', previousId),
+      client.from('monthly_operating_data').update({ import_status: 'confirmed' }).eq('import_batch_id', previousId),
+      client.from('trial_balance_data').update({ import_status: 'confirmed' }).eq('import_batch_id', previousId),
+    ]);
+    await client.from('import_batches').update({ status: 'confirmed' }).eq('id', previousId);
+  }
+  return { restoredBatchId: previousId || null };
+}
+
+export async function loadMappingReviewRows(companyId = null, limit = 500) {
+  const client = requireClient();
+  let query = client
+    .from('normalized_financial_data')
+    .select('id,company_id,fiscal_year,statement_type,raw_account_name,account_name,account_group,account_subgroup,mapping_confidence,needs_review,source_file,source_sheet,source_row,companies(name_th,name_en,ticker_symbol)')
+    .or('needs_review.eq.true,mapping_confidence.lt.0.86,account_group.eq.other')
+    .eq('import_status', 'confirmed')
+    .order('fiscal_year', { ascending: false })
+    .limit(limit);
+  if (companyId) query = query.eq('company_id', companyId);
+  const { data, error } = await query;
+  if (error) throw normalizeSupabaseError(error);
+  return data || [];
+}
+
+export async function updateMappingForRawAccount({ companyId, rawAccountName, statementType, accountGroup, accountSubgroup = null }) {
+  const client = requireClient();
+  const { error: mapError } = await client.from('account_mappings').upsert({
+    company_id: companyId,
+    raw_account_name: rawAccountName,
+    statement_type: statementType,
+    account_group: accountGroup,
+    account_subgroup: accountSubgroup,
+  }, { onConflict: 'company_id,raw_account_name,statement_type' });
+  if (mapError) throw normalizeSupabaseError(mapError);
+  const { error: rowError } = await client.from('normalized_financial_data')
+    .update({ account_group: accountGroup, account_subgroup: accountSubgroup, needs_review: false, mapping_confidence: 1 })
+    .eq('company_id', companyId)
+    .eq('raw_account_name', rawAccountName)
+    .eq('statement_type', statementType);
+  if (rowError) throw normalizeSupabaseError(rowError);
+}
+
+export async function getRawFileSignedUrl(storagePath, expiresIn = 300) {
+  if (!storagePath) return null;
+  const { data, error } = await requireClient().storage.from('raw-financial-files').createSignedUrl(storagePath, expiresIn);
+  if (error) return null;
+  return data?.signedUrl || null;
 }
 
 export async function loadExchangeRates(year) {
