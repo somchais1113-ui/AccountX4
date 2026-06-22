@@ -49,11 +49,19 @@ const MONTHS = [
 
 // INDUSTRY DEFINITIONS
 const INDUSTRIES = {
-  retail:        { th:"ค้าปลีก", en:"Retail", icon:"🛒", color:"#5B7CFA" },
-  manufacturing: { th:"การผลิต", en:"Manufacturing", icon:"🏭", color:"#1FD9A4" },
-  service:       { th:"บริการ", en:"Service", icon:"💼", color:"#A78BFA" },
-  tech:          { th:"เทคโนโลยี", en:"Technology", icon:"💻", color:"#F7B84F" },
-  realestate:    { th:"อสังหาฯ", en:"Real Estate", icon:"🏗", color:"#F7637C" },
+  retail:          { th:"ค้าปลีก", en:"Retail", icon:"🛒", color:"#5B7CFA" },
+  consumer:        { th:"สินค้าอุปโภคบริโภค", en:"Consumer", icon:"🛍️", color:"#5B7CFA" },
+  manufacturing:  { th:"การผลิต", en:"Manufacturing", icon:"🏭", color:"#1FD9A4" },
+  service:         { th:"บริการ", en:"Service", icon:"💼", color:"#A78BFA" },
+  tech:            { th:"เทคโนโลยี", en:"Technology", icon:"💻", color:"#F7B84F" },
+  realestate:      { th:"อสังหาฯ", en:"Real Estate", icon:"🏗", color:"#F7637C" },
+  real_estate:     { th:"อสังหาฯ", en:"Real Estate", icon:"🏗", color:"#F7637C" },
+  healthcare:      { th:"โรงพยาบาล/สุขภาพ", en:"Healthcare", icon:"🏥", color:"#38BDF8" },
+  hospital:        { th:"โรงพยาบาล/สุขภาพ", en:"Healthcare", icon:"🏥", color:"#38BDF8" },
+  banking:         { th:"ธนาคาร", en:"Banking", icon:"🏦", color:"#F7B84F" },
+  finance:         { th:"การเงิน", en:"Finance", icon:"💳", color:"#F7B84F" },
+  construction:    { th:"ก่อสร้าง", en:"Construction", icon:"🚧", color:"#F7637C" },
+  uncategorized:   { th:"ไม่ระบุอุตสาหกรรม", en:"Uncategorized", icon:"🏢", color:"#6B7299" },
 };
 
 const LEGAL_ENTITY_TYPES = {
@@ -635,27 +643,51 @@ function CompaniesPage({store, year, lang, onSelect, onCompare}) {
     setCompareList(prev => prev.includes(id) ? prev.filter(x=>x!==id) : prev.length<3 ? [...prev,id] : prev);
   };
 
-  // Group companies
+  const normalizeIndustryKey = (industry) => {
+    const raw = String(industry || "uncategorized").trim().toLowerCase();
+    if (raw === "real estate") return "real_estate";
+    if (raw === "realestate") return "real_estate";
+    if (raw === "hospital") return "healthcare";
+    return INDUSTRIES[raw] ? raw : "uncategorized";
+  };
+  const normalizeGroupKey = (company) => String(company?.groupId || company?.tickerSymbol || company?.id || "ungrouped");
+  const getIndustryMeta = (industry) => INDUSTRIES[normalizeIndustryKey(industry)] || INDUSTRIES.uncategorized;
+
+  // Group companies safely. Supabase companies may have new industry keys such as
+  // real_estate / healthcare / banking and may not have group_id; the old version
+  // assumed every key existed and could blank the Companies page.
   const grouped = useMemo(()=>{
     const map = {};
     COMPANIES.forEach(c=>{
-      const key = groupBy==="industry" ? c.industry : c.groupId;
+      const key = groupBy==="industry" ? normalizeIndustryKey(c.industry) : normalizeGroupKey(c);
       if (!map[key]) map[key] = [];
       map[key].push(c);
     });
     return map;
-  },[groupBy]);
+  },[groupBy, COMPANIES.length]);
 
-  const getMeta = (key) => groupBy==="industry"
-    ? {...INDUSTRIES[key], color:INDUSTRIES[key].color}
-    : {th:GROUPS[key].th, en:GROUPS[key].en, icon:"🔗", color:C.accent};
+  const getMeta = (key, comps = []) => {
+    if (groupBy==="industry") return getIndustryMeta(key);
+    const group = GROUPS[key];
+    if (group) return {th:group.th, en:group.en, icon:"🔗", color:C.accent};
+    const first = comps[0] || {};
+    return {
+      th:first.groupId ? first.groupId : (first.tickerSymbol || first.nameTh || (th?"ไม่อยู่ในเครือ":"Ungrouped")),
+      en:first.groupId ? first.groupId : (first.tickerSymbol || first.nameEn || "Ungrouped"),
+      icon:"🔗",
+      color:C.accent,
+    };
+  };
 
   const CompanyCard = ({c}) => {
     const years = DataEngine.getAvailableYears(store, c.id);
     const months = DataEngine.countMonths(store, c.id, year);
     const rev = DataEngine.yearTotal(store, c.id, year, "revenue");
     const inCompare = compareList.includes(c.id);
-    const ind = INDUSTRIES[c.industry];
+    const ind = getIndustryMeta(c.industry);
+    const legal = LEGAL_ENTITY_TYPES[defaultLegalEntityType(c)] || LEGAL_ENTITY_TYPES.limited_company;
+    const companyInitial = (c.nameEn || c.nameTh || c.tickerSymbol || "?").trim().charAt(0) || "?";
+    const hasFY = DataEngine.hasNormalizedAnnualData(store, c.id, DataEngine.getDisplayYear(store, c.id, year));
     return (
       <Card style={{borderTop:`3px solid ${c.type==="parent"?C.accent:C.green}`,position:"relative"}}>
         {/* compare checkbox */}
@@ -667,7 +699,7 @@ function CompaniesPage({store, year, lang, onSelect, onCompare}) {
         </div>
         <div onClick={()=>onSelect(c.id)} style={{cursor:"pointer"}}>
           <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12,paddingRight:32}}>
-            <div style={{width:38,height:38,borderRadius:10,background:c.type==="parent"?C.accent:C.green,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:800,color:"#fff"}}>{c.nameEn[0]}</div>
+            <div style={{width:38,height:38,borderRadius:10,background:c.type==="parent"?C.accent:C.green,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:800,color:"#fff"}}>{companyInitial}</div>
             <div>
               <div style={{fontSize:14,fontWeight:800,color:C.white}}>{th?c.nameTh:c.nameEn}</div>
               <div style={{fontSize:12,color:C.muted}}>{th?c.nameEn:c.nameTh}</div>
@@ -676,6 +708,7 @@ function CompaniesPage({store, year, lang, onSelect, onCompare}) {
           <div style={{display:"flex",gap:6,marginBottom:14,flexWrap:"wrap"}}>
             <Badge color={c.type==="parent"?C.accent:C.green}>{c.type==="parent"?(th?"บริษัทแม่":"Parent"):(th?"บริษัทย่อย":"Subsidiary")}</Badge>
             <Badge color={ind.color}>{ind.icon} {th?ind.th:ind.en}</Badge>
+            <Badge color={legal.companyMode === "public" ? C.accent : C.purple}>{legal.icon} {th?legal.th:legal.en}</Badge>
             <Badge color={C.amber}>{c.currency}</Badge>
           </div>
           <div style={{borderTop:`1px solid ${C.border}`,paddingTop:12}}>
@@ -685,7 +718,7 @@ function CompaniesPage({store, year, lang, onSelect, onCompare}) {
             </div>
             <div style={{display:"flex",justifyContent:"space-between"}}>
               <span style={{fontSize:13,color:C.muted}}>{th?"ข้อมูล":"Coverage"}</span>
-              <span style={{fontSize:13,fontWeight:700,color:months===12?C.green:months>0?C.amber:C.red}}>{months}/12 {th?"เดือน":"mo"}</span>
+              <span style={{fontSize:13,fontWeight:700,color:hasFY?C.green:months>0?C.amber:C.red}}>{hasFY ? "FY" : `${months}/12 ${th?"เดือน":"mo"}`}</span>
             </div>
           </div>
         </div>
@@ -716,7 +749,7 @@ function CompaniesPage({store, year, lang, onSelect, onCompare}) {
       </div>
 
       {Object.entries(grouped).map(([key, comps])=>{
-        const meta = getMeta(key);
+        const meta = getMeta(key, comps);
         const totalRev = comps.reduce((s,c)=>s+DataEngine.yearTotal(store,c.id,year,"revenue"),0);
         return (
           <div key={key} style={{marginBottom:28}}>
