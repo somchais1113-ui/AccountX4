@@ -132,3 +132,24 @@ npm run check
 For real financial statement Excel files, the app now saves source traceability fields such as source file, sheet, row, column, and cell. It also imports multiple years from one workbook, so a single annual financial-statement file can update both the current year and comparative year data.
 
 After deploying this version, upload the original `.xlsx` file in the Upload page. The preview screen should show detected years, statement count, parsed rows, and review count before saving.
+
+## Optional v1.5.3 legal entity type migration
+
+หลังรัน `202606220001_private_company_pack.sql` แล้ว ให้รันไฟล์นี้เพิ่มถ้าต้องการเก็บประเภทนิติบุคคลแยกชัดเจน:
+
+```sql
+supabase/migrations/202606220002_legal_entity_type.sql
+```
+
+เพิ่ม field:
+
+- `companies.legal_entity_type`
+- `import_batches.legal_entity_type`
+
+ค่าที่รองรับ:
+
+- `public_limited` = บริษัทมหาชนจำกัด
+- `limited_company` = บริษัทจำกัด
+- `limited_partnership` = ห้างหุ้นส่วนจำกัด
+
+Migration นี้ safe rerun ได้ และมี `notify pgrst, 'reload schema';` ให้แล้ว

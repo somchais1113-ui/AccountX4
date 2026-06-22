@@ -56,6 +56,14 @@ const INDUSTRIES = {
   realestate:    { th:"อสังหาฯ", en:"Real Estate", icon:"🏗", color:"#F7637C" },
 };
 
+const LEGAL_ENTITY_TYPES = {
+  public_limited: { th:"บริษัทมหาชนจำกัด", en:"Public Limited Company", icon:"🏛️", companyMode:"public", tone:"accent" },
+  limited_company: { th:"บริษัทจำกัด", en:"Limited Company", icon:"🏢", companyMode:"private", tone:"purple" },
+  limited_partnership: { th:"ห้างหุ้นส่วนจำกัด", en:"Limited Partnership", icon:"🤝", companyMode:"private", tone:"purple" },
+};
+const legalModeFromType = (legalEntityType) => LEGAL_ENTITY_TYPES[legalEntityType]?.companyMode || "private";
+const defaultLegalEntityType = (company = {}) => company.legalEntityType || (company.companyMode === "public" || company.tickerSymbol ? "public_limited" : "limited_company");
+
 // DATA ENGINE
 const METRIC_GROUPS = {
   revenue: [
@@ -232,11 +240,11 @@ const loadStoredData = () => {
 };
 
 const DEFAULT_COMPANIES = [
-  { id:1, nameTh:"บริษัท อัลฟา จำกัด", nameEn:"Alpha Co., Ltd.", currency:"THB", type:"parent", industry:"retail", groupId:"alpha", companyMode:"private" },
-  { id:2, nameTh:"บริษัท เบต้า จำกัด", nameEn:"Beta Co., Ltd.", currency:"USD", type:"subsidiary", industry:"retail", groupId:"alpha", companyMode:"private" },
-  { id:3, nameTh:"บริษัท แกมมา จำกัด", nameEn:"Gamma Co., Ltd.", currency:"THB", type:"subsidiary", industry:"manufacturing", groupId:"alpha", companyMode:"private" },
-  { id:4, nameTh:"บริษัท เดลต้า จำกัด", nameEn:"Delta Co., Ltd.", currency:"THB", type:"parent", industry:"tech", groupId:"delta", companyMode:"private" },
-  { id:5, nameTh:"บริษัท เอปไซลอน จำกัด", nameEn:"Epsilon Co., Ltd.", currency:"THB", type:"subsidiary", industry:"service", groupId:"delta", companyMode:"private" },
+  { id:1, nameTh:"บริษัท อัลฟา จำกัด", nameEn:"Alpha Co., Ltd.", currency:"THB", type:"parent", industry:"retail", groupId:"alpha", companyMode:"private", legalEntityType:"limited_company" },
+  { id:2, nameTh:"บริษัท เบต้า จำกัด", nameEn:"Beta Co., Ltd.", currency:"USD", type:"subsidiary", industry:"retail", groupId:"alpha", companyMode:"private", legalEntityType:"limited_company" },
+  { id:3, nameTh:"บริษัท แกมมา จำกัด", nameEn:"Gamma Co., Ltd.", currency:"THB", type:"subsidiary", industry:"manufacturing", groupId:"alpha", companyMode:"private", legalEntityType:"limited_company" },
+  { id:4, nameTh:"บริษัท เดลต้า จำกัด", nameEn:"Delta Co., Ltd.", currency:"THB", type:"parent", industry:"tech", groupId:"delta", companyMode:"private", legalEntityType:"limited_company" },
+  { id:5, nameTh:"บริษัท เอปไซลอน จำกัด", nameEn:"Epsilon Co., Ltd.", currency:"THB", type:"subsidiary", industry:"service", groupId:"delta", companyMode:"private", legalEntityType:"limited_company" },
 ];
 let COMPANIES = DEFAULT_COMPANIES;
 const GROUPS = { alpha:{th:"เครืออัลฟา",en:"Alpha Group"}, delta:{th:"เครือเดลต้า",en:"Delta Group"} };
@@ -1412,7 +1420,7 @@ function LoginPage({lang, theme, onTheme, onSession}) {
 function CompanyOnboarding({lang,onCreated}) {
   const C = useC();
   const th = lang==="th";
-  const [form,setForm] = useState({nameTh:"",nameEn:"",currency:"THB",type:"parent",industry:"retail",groupId:"",tickerSymbol:"",fiscalYearEnd:"12-31",companyMode:"private"});
+  const [form,setForm] = useState({nameTh:"",nameEn:"",currency:"THB",type:"parent",industry:"retail",groupId:"",tickerSymbol:"",fiscalYearEnd:"12-31",companyMode:"private",legalEntityType:"limited_company"});
   const [error,setError] = useState("");
   const submit = async event => {
     event.preventDefault(); setError("");
@@ -1425,7 +1433,8 @@ function CompanyOnboarding({lang,onCreated}) {
     <form onSubmit={submit}>
       <label style={{fontSize:12,color:C.muted}}>{th?"ชื่อภาษาไทย":"Thai name"}<input value={form.nameTh} onChange={e=>setForm({...form,nameTh:e.target.value})} required style={field}/></label>
       <label style={{display:"block",fontSize:12,color:C.muted,marginTop:12}}>{th?"ชื่อภาษาอังกฤษ":"English name"}<input value={form.nameEn} onChange={e=>setForm({...form,nameEn:e.target.value})} required style={field}/></label>
-      <label style={{display:"block",fontSize:12,color:C.muted,marginTop:12}}>{th?"ประเภทข้อมูลบริษัท":"Company data mode"}<select value={form.companyMode} onChange={e=>setForm({...form,companyMode:e.target.value,tickerSymbol:e.target.value==='private'?'':form.tickerSymbol})} style={field}><option value="private">{th?"นิติบุคคลทั่วไป / Private Company":"Private Company"}</option><option value="public">{th?"บริษัทมหาชน / Public Listed":"Public Listed"}</option></select></label>
+      <label style={{display:"block",fontSize:12,color:C.muted,marginTop:12}}>{th?"ประเภทนิติบุคคล":"Legal entity type"}<select value={form.legalEntityType} onChange={e=>{const legalEntityType=e.target.value; const nextMode=legalModeFromType(legalEntityType); setForm({...form,legalEntityType,companyMode:nextMode,tickerSymbol:nextMode==='private'?'':form.tickerSymbol});}} style={field}>{Object.entries(LEGAL_ENTITY_TYPES).map(([key,item])=><option key={key} value={key}>{item.icon} {th?item.th:item.en}</option>)}</select></label>
+      <div style={{marginTop:8,padding:"9px 12px",borderRadius:8,background:form.companyMode==='public'?C.accentLo:C.purpleLo,color:form.companyMode==='public'?C.accent:C.purple,fontSize:12,fontWeight:800}}>{form.companyMode==='public' ? (th?"โหมดบริษัทมหาชน: ใช้งบ SET / งบปี / งบไตรมาส":"Public mode: SET-style annual/quarterly statements") : (th?"โหมดนิติบุคคลทั่วไป: ใช้งบการเงิน งบทดลอง และรายงานรายเดือน":"Private mode: financial statements, trial balance and monthly reports")}</div>
       <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:12,marginTop:12}}>
         <label style={{fontSize:12,color:C.muted}}>{th?"สกุลเงิน":"Currency"}<select value={form.currency} onChange={e=>setForm({...form,currency:e.target.value})} style={field}><option>THB</option><option>USD</option><option>EUR</option></select></label>
         <label style={{fontSize:12,color:C.muted}}>{th?"อุตสาหกรรม":"Industry"}<select value={form.industry} onChange={e=>setForm({...form,industry:e.target.value})} style={field}>{Object.keys(INDUSTRIES).map(item=><option key={item}>{item}</option>)}</select></label>
@@ -1600,7 +1609,7 @@ export default function App() {
     // MOCKUP DATA
     if (activeSession.user.id === "mockup-user") {
       setCompanies([
-        { id:1, nameTh:"บริษัท โมดิฟาย ม็อคอัพ จำกัด", nameEn:"Mockup Modify Co., Ltd.", currency:"THB", type:"parent", industry:"tech", groupId:"mockup", tickerSymbol:"MOCKUP", fiscalYearEnd:"12-31", companyMode:"private" }
+        { id:1, nameTh:"บริษัท โมดิฟาย ม็อคอัพ จำกัด", nameEn:"Mockup Modify Co., Ltd.", currency:"THB", type:"parent", industry:"tech", groupId:"mockup", tickerSymbol:"MOCKUP", fiscalYearEnd:"12-31", companyMode:"private", legalEntityType:"limited_company" }
       ]);
       setStore({
         1: {

@@ -1,3 +1,15 @@
+## v1.5.3 Legal Entity Type Upload Options
+
+- Adds explicit legal entity type options to company creation and upload workflows:
+  - บริษัทมหาชนจำกัด / Public Limited Company
+  - บริษัทจำกัด / Limited Company
+  - ห้างหุ้นส่วนจำกัด / Limited Partnership
+- Uses the selected legal entity type to switch upload behavior:
+  - บริษัทมหาชนจำกัด → Public / SET-style financial statements
+  - บริษัทจำกัด and ห้างหุ้นส่วนจำกัด → Private company financial statements, monthly reports, and trial balance
+- Stores `legal_entity_type` on companies and import batches when the migration is installed.
+- Keeps backward compatibility if the migration has not been run yet.
+
 ## v1.5.2 Slide Workspace + Toggle UI
 
 - Built from `finanalytics-v1.5-private-company-pack-checked.zip`.

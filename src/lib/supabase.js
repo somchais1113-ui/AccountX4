@@ -62,12 +62,12 @@ export async function loadCompanies() {
 
   let query = client
     .from("companies")
-    .select("id,name_th,name_en,currency,type,industry,group_id,ticker_symbol,fiscal_year_end,company_mode")
+    .select("id,name_th,name_en,currency,type,industry,group_id,ticker_symbol,fiscal_year_end,company_mode,legal_entity_type")
     .order("id");
   let { data, error } = await query;
 
   // Backward compatible fallback for databases that have not run the v1.5 private-company migration yet.
-  if (error && /company_mode|schema cache|Could not find/i.test(error.message || '')) {
+  if (error && /company_mode|legal_entity_type|schema cache|Could not find/i.test(error.message || '')) {
     const fallback = await client
       .from("companies")
       .select("id,name_th,name_en,currency,type,industry,group_id,ticker_symbol,fiscal_year_end")
@@ -94,6 +94,7 @@ export async function loadCompanies() {
     tickerSymbol: company.ticker_symbol,
     fiscalYearEnd: company.fiscal_year_end,
     companyMode: company.company_mode || (company.ticker_symbol ? 'public' : 'private'),
+    legalEntityType: company.legal_entity_type || (company.company_mode === 'public' || company.ticker_symbol ? 'public_limited' : 'limited_company'),
     role: roles.get(company.id) || "viewer",
   }));
 }
@@ -109,11 +110,12 @@ export async function createCompany(company) {
     group_id: company.groupId || null,
     ticker_symbol: company.tickerSymbol || null,
     fiscal_year_end: company.fiscalYearEnd || '12-31',
-    company_mode: company.companyMode || (company.tickerSymbol ? 'public' : 'private')
+    company_mode: company.companyMode || (company.tickerSymbol ? 'public' : 'private'),
+    legal_entity_type: company.legalEntityType || (company.companyMode === 'public' || company.tickerSymbol ? 'public_limited' : 'limited_company')
   };
   let { data, error } = await client.from("companies").insert(payload).select("id").single();
-  if (error && /company_mode|schema cache|Could not find/i.test(error.message || '')) {
-    const { company_mode, ...fallbackPayload } = payload;
+  if (error && /company_mode|legal_entity_type|schema cache|Could not find/i.test(error.message || '')) {
+    const { company_mode, legal_entity_type, ...fallbackPayload } = payload;
     const fallback = await client.from("companies").insert(fallbackPayload).select("id").single();
     data = fallback.data;
     error = fallback.error;
@@ -133,11 +135,12 @@ export async function updateCompany(id, company) {
     group_id: company.groupId || null,
     ticker_symbol: company.tickerSymbol || null,
     fiscal_year_end: company.fiscalYearEnd || '12-31',
-    company_mode: company.companyMode || (company.tickerSymbol ? 'public' : 'private')
+    company_mode: company.companyMode || (company.tickerSymbol ? 'public' : 'private'),
+    legal_entity_type: company.legalEntityType || (company.companyMode === 'public' || company.tickerSymbol ? 'public_limited' : 'limited_company')
   };
   let { error } = await client.from("companies").update(payload).eq("id", id);
-  if (error && /company_mode|schema cache|Could not find/i.test(error.message || '')) {
-    const { company_mode, ...fallbackPayload } = payload;
+  if (error && /company_mode|legal_entity_type|schema cache|Could not find/i.test(error.message || '')) {
+    const { company_mode, legal_entity_type, ...fallbackPayload } = payload;
     const fallback = await client.from("companies").update(fallbackPayload).eq("id", id);
     error = fallback.error;
   }
@@ -259,11 +262,12 @@ export async function saveImportBatch(companyId, batchDetails, normalizedDataRow
     statement_scope: batchDetails.statementScope || 'consolidated',
     source_type: batchDetails.sourceType || 'public_financial_statement',
     parser_profile: batchDetails.parserProfile || null,
+    legal_entity_type: batchDetails.legalEntityType || null,
     status: 'confirmed'
   };
   let { data: batch, error: batchError } = await client.from("import_batches").insert(batchPayload).select("id").single();
-  if (batchError && /source_type|parser_profile|schema cache|Could not find/i.test(batchError.message || '')) {
-    const { source_type, parser_profile, ...fallbackBatchPayload } = batchPayload;
+  if (batchError && /source_type|parser_profile|legal_entity_type|schema cache|Could not find/i.test(batchError.message || '')) {
+    const { source_type, parser_profile, legal_entity_type, ...fallbackBatchPayload } = batchPayload;
     const fallback = await client.from("import_batches").insert(fallbackBatchPayload).select("id").single();
     batch = fallback.data;
     batchError = fallback.error;
@@ -338,11 +342,12 @@ export async function savePrivateImportBatch(companyId, batchDetails, privatePay
     statement_scope: batchDetails.statementScope || 'private_company',
     source_type: batchDetails.sourceType || 'private_company_file',
     parser_profile: batchDetails.parserProfile || 'PRIVATE_COMPANY_IMPORT_PACK_V1',
+    legal_entity_type: batchDetails.legalEntityType || null,
     status: 'confirmed'
   };
   let { data: batch, error: batchError } = await client.from("import_batches").insert(batchPayload).select("id").single();
-  if (batchError && /source_type|parser_profile|schema cache|Could not find/i.test(batchError.message || '')) {
-    const { source_type, parser_profile, ...fallbackBatchPayload } = batchPayload;
+  if (batchError && /source_type|parser_profile|legal_entity_type|schema cache|Could not find/i.test(batchError.message || '')) {
+    const { source_type, parser_profile, legal_entity_type, ...fallbackBatchPayload } = batchPayload;
     const fallback = await client.from("import_batches").insert(fallbackBatchPayload).select("id").single();
     batch = fallback.data;
     batchError = fallback.error;

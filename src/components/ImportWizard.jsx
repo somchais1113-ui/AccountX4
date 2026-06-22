@@ -13,6 +13,14 @@ const SOURCE_OPTIONS = {
   ],
 };
 
+const LEGAL_ENTITY_TYPES = {
+  public_limited: { icon: '🏛️', th: 'บริษัทมหาชนจำกัด', en: 'Public Limited Company', companyMode: 'public' },
+  limited_company: { icon: '🏢', th: 'บริษัทจำกัด', en: 'Limited Company', companyMode: 'private' },
+  limited_partnership: { icon: '🤝', th: 'ห้างหุ้นส่วนจำกัด', en: 'Limited Partnership', companyMode: 'private' },
+};
+const legalModeFromType = (legalEntityType) => LEGAL_ENTITY_TYPES[legalEntityType]?.companyMode || 'private';
+const getDefaultLegalEntityType = (company) => company?.legalEntityType || (company?.companyMode === 'public' || company?.tickerSymbol ? 'public_limited' : 'limited_company');
+
 function sourceToParserType(sourceType) {
   if (sourceType === 'private_financial_statement') return 'financial_statement';
   if (sourceType === 'private_monthly_report') return 'monthly_report';
@@ -22,7 +30,8 @@ function sourceToParserType(sourceType) {
 
 export default function ImportWizard({ companyId, company, onImportSuccess, lang, theme, C }) {
   const th = lang === 'th';
-  const companyMode = company?.companyMode || (company?.tickerSymbol ? 'public' : 'private');
+  const [legalEntityType, setLegalEntityType] = useState(getDefaultLegalEntityType(company));
+  const companyMode = legalModeFromType(legalEntityType);
   const [sourceType, setSourceType] = useState(companyMode === 'private' ? 'private_financial_statement' : 'public_financial_statement');
   const [step, setStep] = useState(1);
   const [dragging, setDragging] = useState(false);
@@ -36,6 +45,11 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
 
   const sourceOptions = SOURCE_OPTIONS[companyMode] || SOURCE_OPTIONS.private;
   const activeSource = sourceOptions.find(item => item.id === sourceType) || sourceOptions[0];
+
+  useEffect(() => {
+    const nextLegalEntityType = getDefaultLegalEntityType(company);
+    setLegalEntityType(nextLegalEntityType);
+  }, [companyId, company]);
 
   useEffect(() => {
     const defaultSource = companyMode === 'private' ? 'private_financial_statement' : 'public_financial_statement';
@@ -62,7 +76,7 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
           return;
         }
         const primaryYear = summary?.primaryYear || rows[0].fiscal_year;
-        setBatchDetails(prev => ({ ...prev, fiscalYear: primaryYear, periodType: 'annual', period: 'FY', statementScope: rows[0].statement_scope || 'consolidated', sourceType, parserProfile: summary?.parserVersion || 'IMPORT_PARSER_V3_INDUSTRY_PACK_V1' }));
+        setBatchDetails(prev => ({ ...prev, fiscalYear: primaryYear, periodType: 'annual', period: 'FY', statementScope: rows[0].statement_scope || 'consolidated', sourceType, legalEntityType, parserProfile: summary?.parserVersion || 'IMPORT_PARSER_V3_INDUSTRY_PACK_V1' }));
         setPrivatePayload(null);
         setParseSummary(summary);
         setParsedData(rows);
@@ -110,6 +124,7 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
         period: sourceType === 'private_monthly_report' ? 'MIXED' : 'FY',
         statementScope: 'private_company',
         sourceType,
+        legalEntityType,
         parserProfile: summary.parserVersion || 'PRIVATE_COMPANY_IMPORT_PACK_V1',
       }));
       setPrivatePayload(payload);
@@ -192,6 +207,34 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
             </div>
             <div style={{ padding: '7px 12px', borderRadius: 999, background: companyMode === 'private' ? C.purpleLo : C.accentLo, color: companyMode === 'private' ? C.purple : C.accent, fontWeight: 800, fontSize: 12 }}>
               {companyMode === 'private' ? (th ? 'นิติบุคคลทั่วไป' : 'Private') : (th ? 'บริษัทมหาชน' : 'Public')}
+            </div>
+          </div>
+
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ fontSize: 12, color: C.muted, fontWeight: 800, marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              {th ? 'ประเภทนิติบุคคล' : 'Legal Entity Type'}
+            </div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              {Object.entries(LEGAL_ENTITY_TYPES).map(([key, item]) => {
+                const active = legalEntityType === key;
+                return (
+                  <button key={key} type="button" onClick={() => setLegalEntityType(key)} style={{
+                    border: `1px solid ${active ? C.accent : C.border}`,
+                    background: active ? C.accentLo : C.card,
+                    color: active ? C.accent : C.text,
+                    borderRadius: 999,
+                    padding: '8px 13px',
+                    cursor: 'pointer',
+                    fontWeight: 850,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 7,
+                    fontSize: 13,
+                  }}>
+                    <span>{item.icon}</span><span>{th ? item.th : item.en}</span>
+                  </button>
+                );
+              })}
             </div>
           </div>
 
