@@ -1,5 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { inferAccountingStandardProfile } from "./accountingStandards.js";
+import { enrichRowSemantics, analyzeMappingRowSafety, normalizeAccountKey, buildReadinessBundle, flattenMetricSnapshotRows, humanReadinessLabel } from "./accountingEngine.js";
 
 // Vite exposes only variables that start with VITE_ to browser code.
 // Values are embedded at build time, so Vercel/Netlify must be redeployed after env changes.
@@ -43,6 +44,16 @@ const OPTIONAL_MAPPING_COLUMNS = new Set([
   'standard_reason',
   'consolidation_indicator',
   'business_combination_indicator',
+  'line_role',
+  'metric_role',
+  'section_path',
+  'parent_heading',
+  'risk_flags',
+  'mapping_status',
+  'approval_scope',
+  'approved_mapping_id',
+  'is_dashboard_eligible',
+  'is_export_eligible',
 ]);
 
 const OPTIONAL_APPROVAL_COLUMNS = new Set([
@@ -56,6 +67,12 @@ const OPTIONAL_APPROVAL_COLUMNS = new Set([
   'standard_source',
   'standard_label_th',
   'standard_label_en',
+  'normalized_account_name',
+  'statement_scope',
+  'accounting_standard_profile',
+  'line_role',
+  'risk_flags',
+  'approval_scope',
 ]);
 
 function stripColumns(row, columns) {
@@ -434,7 +451,7 @@ export async function loadFinancialDataSnapshot(batchId) {
 
   const { data: batch, error: batchError } = await client
     .from('import_batches')
-    .select('id,company_id,file_name,fiscal_year,period_type,period,statement_scope,source_type,parser_profile,legal_entity_type,status,total_rows,review_count,file_hash,file_size,storage_path,imported_at,companies(name_th,name_en,ticker_symbol,industry,currency)')
+    .select('id,company_id,file_name,fiscal_year,period_type,period,statement_scope,source_type,parser_profile,legal_entity_type,status,total_rows,review_count,readiness_status,readiness_score,dashboard_ready,export_ready,external_use_ready,last_validated_at,file_hash,file_size,storage_path,imported_at,companies(name_th,name_en,ticker_symbol,industry,currency)')
     .eq('id', batchId)
     .single();
   if (batchError) throw normalizeSupabaseError(batchError);
@@ -672,6 +689,12 @@ async function upsertAccountMappings(client, companyId, rows = []) {
         statement_type: row.statement_type,
         account_group: row.account_group,
         account_subgroup: row.account_subgroup || null,
+        normalized_account_name: normalizeAccountKey(row.raw_account_name),
+        statement_scope: row.statement_scope || 'any',
+        accounting_standard_profile: row.accounting_standard_profile || null,
+        line_role: row.line_role || null,
+        risk_flags: Array.isArray(row.risk_flags) ? row.risk_flags : [],
+        approval_scope: row.approval_scope || 'import_approved_reuse',
         industry_metric: row.industry_metric || null,
         is_approved: true,
         mapping_source: 'approved_mapping',
@@ -770,7 +793,7 @@ export async function saveImportBatch(companyId, batchDetails, normalizedDataRow
     status: 'confirmed'
   };
   let { data: batch, error: batchError } = await client.from("import_batches").insert(batchPayload).select("id").single();
-  if (batchError && /source_type|parser_profile|legal_entity_type|accounting_standard_profile|standard_validation_summary|data_quality_score|file_hash|file_size|storage_path|total_rows|review_count|schema cache|Could not find/i.test(batchError.message || '')) {
+  if (batchError && /source_type|parser_profile|legal_entity_type|accounting_standard_profile|standard_validation_summary|data_quality_score|readiness_status|readiness_score|dashboard_ready|export_ready|external_use_ready|last_validated_at|file_hash|file_size|storage_path|total_rows|review_count|schema cache|Could not find/i.test(batchError.message || '')) {
     const { source_type, parser_profile, legal_entity_type, accounting_standard_profile, standard_validation_summary, data_quality_score, file_hash, file_size, storage_path, validation_summary, review_count, total_rows, ...fallbackBatchPayload } = batchPayload;
     const fallback = await client.from("import_batches").insert(fallbackBatchPayload).select("id").single();
     batch = fallback.data;
@@ -779,7 +802,8 @@ export async function saveImportBatch(companyId, batchDetails, normalizedDataRow
   if (batchError) throw normalizeSupabaseError(batchError);
   
   // 2. Insert normalized data
-  const payload = safeRows.map(row => ({
+  const semanticRows = safeRows.map((row) => enrichRowSemantics(row));
+  const payload = semanticRows.map(row => ({
     company_id: companyId,
     fiscal_year: row.fiscal_year,
     period_type: row.period_type || 'annual',
@@ -819,6 +843,16 @@ export async function saveImportBatch(companyId, batchDetails, normalizedDataRow
     standard_reason: row.standard_reason || null,
     consolidation_indicator: row.consolidation_indicator || null,
     business_combination_indicator: row.business_combination_indicator || null,
+    line_role: row.line_role || null,
+    metric_role: row.metric_role || null,
+    section_path: row.section_path || row.section || null,
+    parent_heading: row.parent_heading || row.section || null,
+    risk_flags: Array.isArray(row.risk_flags) ? row.risk_flags : [],
+    mapping_status: row.mapping_status || (row.needs_review ? 'suggested' : 'approved'),
+    approval_scope: row.approval_scope || null,
+    approved_mapping_id: row.approved_mapping_id || null,
+    is_dashboard_eligible: row.is_dashboard_eligible ?? null,
+    is_export_eligible: row.is_export_eligible ?? null,
     import_status: 'confirmed'
   }));
   
@@ -847,7 +881,7 @@ export async function saveImportBatch(companyId, batchDetails, normalizedDataRow
 
   const rowsImported = await insertInChunks(client, "normalized_financial_data", payload);
   await uploadRawFileForBatch(client, companyId, batch.id, batchDetails);
-  await upsertAccountMappings(client, companyId, safeRows);
+  await upsertAccountMappings(client, companyId, semanticRows);
 
   await createAlertEventSafe(client, {
     eventType: 'import_success',
@@ -878,8 +912,11 @@ export async function saveImportBatch(companyId, batchDetails, normalizedDataRow
       metadata: { file_name: batchDetails.fileName, review_count: batchDetails.reviewCount, rows_imported: rowsImported },
     });
   }
+
+  let readiness = null;
+  try { readiness = await rebuildAccountingReadiness({ companyId, batchId: batch.id, strictAnnual: true }); } catch (error) { console.warn('Readiness rebuild failed after import', error?.message || error); }
   
-  return { batchId: batch.id, rowsImported };
+  return { batchId: batch.id, rowsImported, readiness };
 }
 
 
@@ -912,7 +949,7 @@ export async function savePrivateImportBatch(companyId, batchDetails, privatePay
     status: 'confirmed'
   };
   let { data: batch, error: batchError } = await client.from("import_batches").insert(batchPayload).select("id").single();
-  if (batchError && /source_type|parser_profile|legal_entity_type|accounting_standard_profile|standard_validation_summary|data_quality_score|file_hash|file_size|storage_path|total_rows|review_count|schema cache|Could not find/i.test(batchError.message || '')) {
+  if (batchError && /source_type|parser_profile|legal_entity_type|accounting_standard_profile|standard_validation_summary|data_quality_score|readiness_status|readiness_score|dashboard_ready|export_ready|external_use_ready|last_validated_at|file_hash|file_size|storage_path|total_rows|review_count|schema cache|Could not find/i.test(batchError.message || '')) {
     const { source_type, parser_profile, legal_entity_type, accounting_standard_profile, standard_validation_summary, data_quality_score, file_hash, file_size, storage_path, validation_summary, review_count, total_rows, ...fallbackBatchPayload } = batchPayload;
     const fallback = await client.from("import_batches").insert(fallbackBatchPayload).select("id").single();
     batch = fallback.data;
@@ -1102,19 +1139,22 @@ export async function savePrivateImportBatch(companyId, batchDetails, privatePay
       metadata: { file_name: batchDetails.fileName, review_count: privatePayload.summary.reviewCount },
     });
   }
-  return { batchId: batch.id, rowsImported };
+  let readiness = null;
+  try { readiness = await rebuildAccountingReadiness({ companyId, batchId: batch.id, strictAnnual: true }); } catch (error) { console.warn('Readiness rebuild failed after private import', error?.message || error); }
+
+  return { batchId: batch.id, rowsImported, readiness };
 }
 
 export async function loadImportHistory(companyId = null, limit = 200) {
   const client = requireClient();
   let query = client
     .from('import_batches')
-    .select('id,company_id,file_name,fiscal_year,period_type,period,statement_scope,source_type,parser_profile,legal_entity_type,status,total_rows,review_count,file_hash,file_size,storage_path,imported_at,companies(name_th,name_en,ticker_symbol,industry,currency)')
+    .select('id,company_id,file_name,fiscal_year,period_type,period,statement_scope,source_type,parser_profile,legal_entity_type,status,total_rows,review_count,readiness_status,readiness_score,dashboard_ready,export_ready,external_use_ready,last_validated_at,file_hash,file_size,storage_path,imported_at,companies(name_th,name_en,ticker_symbol,industry,currency)')
     .order('imported_at', { ascending: false })
     .limit(limit);
   if (companyId) query = query.eq('company_id', companyId);
   let { data, error } = await query;
-  if (error && /source_type|parser_profile|legal_entity_type|accounting_standard_profile|standard_validation_summary|data_quality_score|file_hash|file_size|storage_path|total_rows|review_count|schema cache|Could not find/i.test(error.message || '')) {
+  if (error && /source_type|parser_profile|legal_entity_type|accounting_standard_profile|standard_validation_summary|data_quality_score|readiness_status|readiness_score|dashboard_ready|export_ready|external_use_ready|last_validated_at|file_hash|file_size|storage_path|total_rows|review_count|schema cache|Could not find/i.test(error.message || '')) {
     let fallback = client
       .from('import_batches')
       .select('id,company_id,file_name,fiscal_year,period_type,period,statement_scope,status,imported_at,companies(name_th,name_en,ticker_symbol,industry,currency)')
@@ -1142,6 +1182,177 @@ export async function loadImportBatchRows(batchId, limit = 500) {
     monthly: safe(monthly),
     trialBalance: safe(trial),
   };
+}
+
+
+const READINESS_IMPORT_BATCH_COLUMNS = new Set([
+  'readiness_status', 'readiness_score', 'dashboard_ready', 'export_ready', 'external_use_ready',
+  'validation_summary', 'last_validated_at', 'export_warning_ack_required'
+]);
+const READINESS_SNAPSHOT_COLUMNS = new Set(['readiness_status', 'readiness_score']);
+
+function summarizeReadinessForBatch(bundle = {}) {
+  if (!bundle.summaries?.length) {
+    return {
+      readiness_status: 'not_ready', readiness_score: 0, dashboard_ready: false, export_ready: false, external_use_ready: false,
+      validation_summary: { message: 'No normalized rows available for readiness validation.' },
+    };
+  }
+  const order = { not_ready: 0, mapping_review_required: 1, dashboard_ready: 2, export_ready: 3, external_use_ready: 4 };
+  const weakest = [...bundle.summaries].sort((a, b) => (order[a.readiness_status] || 0) - (order[b.readiness_status] || 0))[0];
+  const score = Math.round(bundle.summaries.reduce((sum, item) => sum + Number(item.readiness_score || 0), 0) / bundle.summaries.length);
+  return {
+    readiness_status: weakest.readiness_status || 'not_ready',
+    readiness_score: score,
+    dashboard_ready: bundle.summaries.every((item) => item.dashboard_ready),
+    export_ready: bundle.summaries.every((item) => item.export_ready),
+    external_use_ready: bundle.summaries.every((item) => item.external_use_ready),
+    export_warning_ack_required: bundle.summaries.some((item) => item.warnings?.length || item.blocking_reasons?.length),
+    validation_summary: {
+      summaries: bundle.summaries.map((item) => ({
+        fiscal_year: item.fiscal_year, period: item.period, period_type: item.period_type, statement_scope: item.statement_scope,
+        readiness_status: item.readiness_status, readiness_score: item.readiness_score,
+        dashboard_ready: item.dashboard_ready, export_ready: item.export_ready, external_use_ready: item.external_use_ready,
+        missing_core_metrics: item.missing_core_metrics, review_rows: item.review_rows,
+        risk_flags: item.risk_flags, blocking_reasons: item.blocking_reasons, warnings: item.warnings,
+        validation_counts: item.validation_counts,
+      })),
+      validation_result_count: bundle.results?.length || 0,
+      generated_by: 'accounting_engine_v1_9_1',
+    },
+  };
+}
+
+async function safeDeleteReadinessRows(client, batchId) {
+  if (!batchId) return;
+  try { await client.from('validation_results').delete().eq('import_batch_id', batchId); } catch (_) {}
+  try { await client.from('financial_metrics_snapshots').delete().eq('import_batch_id', batchId); } catch (_) {}
+}
+
+export async function rebuildAccountingReadiness({ companyId = null, batchId = null, strictAnnual = true } = {}) {
+  const client = requireClient();
+  let query = client.from('normalized_financial_data').select('*').eq('import_status', 'confirmed');
+  if (batchId) query = query.eq('import_batch_id', batchId);
+  if (companyId) query = query.eq('company_id', companyId);
+  const { data: rows, error } = await query.limit(5000);
+  if (error) throw normalizeSupabaseError(error);
+  const semanticRows = (rows || []).map(enrichRowSemantics);
+
+  // Best-effort backfill semantic columns. This is intentionally row-by-row and non-blocking
+  // because older projects may not have run the v1.9.0/1.9.1 migrations yet.
+  for (const row of semanticRows.slice(0, 1000)) {
+    try {
+      const patch = {
+        line_role: row.line_role,
+        metric_role: row.metric_role,
+        risk_flags: Array.isArray(row.risk_flags) ? row.risk_flags : [],
+        mapping_status: row.mapping_status,
+        is_dashboard_eligible: Boolean(row.is_dashboard_eligible),
+        is_export_eligible: Boolean(row.is_export_eligible),
+        account_group: row.account_group,
+        account_subgroup: row.account_subgroup,
+        suggested_account_group: row.suggested_account_group,
+        suggested_account_subgroup: row.suggested_account_subgroup,
+        review_reason: row.review_reason,
+        needs_review: Boolean(row.needs_review),
+      };
+      const res = await client.from('normalized_financial_data').update(patch).eq('id', row.id);
+      if (res.error && !isMissingOptionalColumnError(res.error, OPTIONAL_MAPPING_COLUMNS)) throw res.error;
+    } catch (_) {}
+  }
+
+  const bundle = buildReadinessBundle(semanticRows, { strictAnnual });
+  if (batchId) await safeDeleteReadinessRows(client, batchId);
+
+  const validationPayload = (bundle.results || []).map((result) => ({
+    company_id: result.company_id || companyId || null,
+    import_batch_id: batchId || null,
+    fiscal_year: result.fiscal_year || null,
+    period: result.period || 'FY',
+    period_type: result.period_type || 'annual',
+    statement_scope: result.statement_scope || 'unknown',
+    validation_type: result.validation_type || 'unknown',
+    severity: result.severity || 'info',
+    difference: result.difference ?? null,
+    message: result.message || null,
+    metadata: { engine: 'accounting_engine_v1_9_1' },
+  }));
+  if (validationPayload.length) {
+    try { await client.from('validation_results').insert(validationPayload); } catch (_) {}
+  }
+
+  const snapshotPayload = [];
+  for (const summary of bundle.summaries || []) {
+    const key = [summary.company_id || '', summary.fiscal_year || '', summary.period || 'FY', summary.period_type || 'annual', summary.statement_scope || 'unknown'].join('|');
+    const bucket = bundle.buckets?.[key];
+    if (!bucket) continue;
+    snapshotPayload.push(...flattenMetricSnapshotRows({ bucket, summary, importBatchId: batchId }));
+  }
+  if (snapshotPayload.length) {
+    let { error: snapError } = await client.from('financial_metrics_snapshots').upsert(snapshotPayload, { onConflict: 'company_id,import_batch_id,fiscal_year,period,period_type,statement_scope,metric_key' });
+    if (snapError && isMissingOptionalColumnError(snapError, READINESS_SNAPSHOT_COLUMNS)) {
+      const fallback = snapshotPayload.map((row) => stripColumns(row, READINESS_SNAPSHOT_COLUMNS));
+      const res = await client.from('financial_metrics_snapshots').upsert(fallback, { onConflict: 'company_id,import_batch_id,fiscal_year,period,period_type,statement_scope,metric_key' });
+      snapError = res.error;
+    }
+    if (snapError) console.warn('Metric snapshot upsert failed', snapError.message || snapError);
+  }
+
+  const summary = summarizeReadinessForBatch(bundle);
+  if (batchId) {
+    const batchPatch = { ...summary, last_validated_at: new Date().toISOString() };
+    let { error: batchError } = await client.from('import_batches').update(batchPatch).eq('id', batchId);
+    if (batchError && isMissingOptionalColumnError(batchError, READINESS_IMPORT_BATCH_COLUMNS)) {
+      const res = await client.from('import_batches').update(stripColumns(batchPatch, READINESS_IMPORT_BATCH_COLUMNS)).eq('id', batchId);
+      batchError = res.error;
+    }
+    if (batchError) console.warn('Import batch readiness update failed', batchError.message || batchError);
+  }
+  return { bundle, summary, rowsAnalyzed: semanticRows.length, validationRows: validationPayload.length, snapshotRows: snapshotPayload.length };
+}
+
+export async function loadAccountingReadiness(companyId = null, limit = 300) {
+  const client = requireClient();
+  let query = client
+    .from('import_batches')
+    .select('id,company_id,file_name,fiscal_year,period,period_type,statement_scope,status,total_rows,review_count,readiness_status,readiness_score,dashboard_ready,export_ready,external_use_ready,validation_summary,last_validated_at,imported_at,companies(name_th,name_en,ticker_symbol,industry,currency)')
+    .order('imported_at', { ascending: false })
+    .limit(limit);
+  if (companyId) query = query.eq('company_id', companyId);
+  let { data, error } = await query;
+  if (error && isMissingOptionalColumnError(error, READINESS_IMPORT_BATCH_COLUMNS)) {
+    let fallback = client
+      .from('import_batches')
+      .select('id,company_id,file_name,fiscal_year,period,period_type,statement_scope,status,total_rows,review_count,imported_at,companies(name_th,name_en,ticker_symbol,industry,currency)')
+      .order('imported_at', { ascending: false })
+      .limit(limit);
+    if (companyId) fallback = fallback.eq('company_id', companyId);
+    const res = await fallback;
+    data = (res.data || []).map((row) => ({ ...row, readiness_status: 'not_validated', readiness_score: null, dashboard_ready: false, export_ready: false, external_use_ready: false }));
+    error = res.error;
+  }
+  if (error) throw normalizeSupabaseError(error);
+  return data || [];
+}
+
+export async function loadValidationResults({ companyId = null, batchId = null, limit = 500 } = {}) {
+  const client = requireClient();
+  let query = client.from('validation_results').select('*').order('created_at', { ascending: false }).limit(limit);
+  if (companyId) query = query.eq('company_id', companyId);
+  if (batchId) query = query.eq('import_batch_id', batchId);
+  const { data, error } = await query;
+  if (error) return [];
+  return data || [];
+}
+
+export async function loadFinancialMetricSnapshots({ companyId = null, batchId = null, limit = 2000 } = {}) {
+  const client = requireClient();
+  let query = client.from('financial_metrics_snapshots').select('*').order('fiscal_year', { ascending: false }).limit(limit);
+  if (companyId) query = query.eq('company_id', companyId);
+  if (batchId) query = query.eq('import_batch_id', batchId);
+  const { data, error } = await query;
+  if (error) return [];
+  return data || [];
 }
 
 export async function rollbackImportBatch(batchId) {
@@ -1191,7 +1402,7 @@ export async function loadMappingReviewRows(companyId = null, limit = 500) {
   const client = requireClient();
   const baseQuery = () => client
     .from('normalized_financial_data')
-    .select('id,company_id,fiscal_year,statement_type,raw_account_name,account_name,account_group,account_subgroup,mapping_confidence,mapping_source,suggested_account_group,suggested_account_subgroup,review_reason,needs_review,source_file,source_sheet,source_row,companies(name_th,name_en,ticker_symbol)')
+    .select('id,company_id,fiscal_year,period,period_type,statement_scope,statement_type,raw_account_name,account_name,account_group,account_subgroup,mapping_confidence,mapping_source,suggested_account_group,suggested_account_subgroup,review_reason,needs_review,source_file,source_sheet,source_row,accounting_standard_profile,standard_ref,standard_source,standard_reason,standard_label_th,standard_label_en,line_role,metric_role,risk_flags,mapping_status,is_dashboard_eligible,is_export_eligible,companies(name_th,name_en,ticker_symbol)')
     .or('needs_review.eq.true,mapping_confidence.lt.0.86,account_group.eq.other,mapping_source.in.(accounting_dictionary,ai_similarity,unknown)')
     .eq('import_status', 'confirmed')
     .order('fiscal_year', { ascending: false })
@@ -1223,7 +1434,7 @@ export async function loadMappingReviewRows(companyId = null, limit = 500) {
   return data || [];
 }
 
-export async function updateMappingForRawAccount({ companyId, rawAccountName, statementType, accountGroup, accountSubgroup = null }) {
+export async function updateMappingForRawAccount({ companyId, rawAccountName, statementType, accountGroup, accountSubgroup = null, statementScope = null, accountingStandardProfile = null, lineRole = null, approvalScope = 'single_row' }) {
   const client = requireClient();
   const actor = await getCurrentActor(client);
   const mapPayload = {
@@ -1232,6 +1443,11 @@ export async function updateMappingForRawAccount({ companyId, rawAccountName, st
     statement_type: statementType,
     account_group: accountGroup,
     account_subgroup: accountSubgroup,
+    normalized_account_name: normalizeAccountKey(rawAccountName),
+    statement_scope: statementScope || 'any',
+    accounting_standard_profile: accountingStandardProfile || null,
+    line_role: lineRole || null,
+    approval_scope: approvalScope,
     is_approved: true,
     mapping_source: 'approved_mapping',
     approved_by: actor.actor_user_id || null,
@@ -1254,6 +1470,12 @@ export async function updateMappingForRawAccount({ companyId, rawAccountName, st
     suggested_account_group: accountGroup,
     suggested_account_subgroup: accountSubgroup,
     review_reason: null,
+    mapping_status: 'approved',
+    approval_scope: approvalScope,
+    line_role: lineRole || null,
+    risk_flags: [],
+    is_dashboard_eligible: true,
+    is_export_eligible: true,
   };
   let { error: rowError } = await client.from('normalized_financial_data')
     .update(rowUpdate)
@@ -1269,6 +1491,43 @@ export async function updateMappingForRawAccount({ companyId, rawAccountName, st
     rowError = fallback.error;
   }
   if (rowError) throw normalizeSupabaseError(rowError);
+
+  // Best-effort readiness rebuild for affected batches so Mapping Center changes
+  // immediately flow into Dashboard/Data Quality/Export gates.
+  try {
+    const { data: affectedRows } = await client.from('normalized_financial_data')
+      .select('import_batch_id')
+      .eq('company_id', companyId)
+      .eq('raw_account_name', rawAccountName)
+      .eq('statement_type', statementType)
+      .eq('import_status', 'confirmed');
+    const batchIds = [...new Set((affectedRows || []).map((r) => r.import_batch_id).filter(Boolean))];
+    for (const id of batchIds) await rebuildAccountingReadiness({ companyId, batchId: id, strictAnnual: true });
+  } catch (error) { console.warn('Readiness rebuild failed after mapping approval', error?.message || error); }
+
+  // Best-effort decision ledger for v1.9.0 Accounting Engine Foundation.
+  // It is intentionally non-blocking so older databases that have not run 004 yet still work.
+  try {
+    await client.from('mapping_decisions').insert({
+      company_id: companyId,
+      raw_account_name: rawAccountName,
+      normalized_account_name: normalizeAccountKey(rawAccountName),
+      statement_type: statementType,
+      statement_scope: statementScope || 'any',
+      accounting_standard_profile: accountingStandardProfile || null,
+      line_role: lineRole || null,
+      metric_role: null,
+      account_group: accountGroup,
+      account_subgroup: accountSubgroup,
+      risk_flags: [],
+      confidence: 1,
+      decision_status: 'approved',
+      decision_method: approvalScope,
+      decision_reason: 'Human approved account mapping from Account Mapping Center.',
+      approved_by: actor.actor_user_id || null,
+    });
+  } catch (_) {}
+
   await createAlertEventSafe(client, {
     eventType: 'mapping_changed',
     severity: 'warning',
@@ -1277,6 +1536,45 @@ export async function updateMappingForRawAccount({ companyId, rawAccountName, st
     message: `${rawAccountName} approved as ${accountGroup}.`,
     metadata: { raw_account_name: rawAccountName, statement_type: statementType, account_group: accountGroup, account_subgroup: accountSubgroup, mapping_source: 'approved_mapping' },
   });
+}
+
+
+export async function bulkApproveMappingRows({ rows = [], selectedGroups = {}, approvalScope = 'bulk_safe_confirm' } = {}) {
+  const client = requireClient();
+  const actor = await getCurrentActor(client);
+  const safeRows = rows
+    .map((row) => {
+      const selectedGroup = selectedGroups[row.id] || row.suggested_account_group || row.account_group || 'other';
+      const safety = analyzeMappingRowSafety(row, selectedGroup);
+      return { row, selectedGroup, safety };
+    })
+    .filter((item) => item.safety.safe);
+  if (!safeRows.length) return { approved: 0, skipped: rows.length };
+
+  for (const { row, selectedGroup, safety } of safeRows) {
+    const subgroup = row.suggested_account_subgroup || row.account_subgroup || safety.adjusted.account_subgroup || selectedGroup;
+    await updateMappingForRawAccount({
+      companyId: row.company_id,
+      rawAccountName: row.raw_account_name,
+      statementType: row.statement_type,
+      accountGroup: selectedGroup,
+      accountSubgroup: subgroup,
+      statementScope: row.statement_scope || null,
+      accountingStandardProfile: row.accounting_standard_profile || null,
+      lineRole: safety.lineRole || row.line_role || null,
+      approvalScope,
+    });
+  }
+
+  await createAlertEventSafe(client, {
+    eventType: 'mapping_changed',
+    severity: 'info',
+    companyId: safeRows[0]?.row?.company_id || null,
+    title: 'Bulk safe mapping approved',
+    message: `${safeRows.length} safe mapping row(s) approved by ${actor.actor_email || 'current user'}.`,
+    metadata: { approval_scope: approvalScope, approved_rows: safeRows.length, skipped_rows: rows.length - safeRows.length },
+  });
+  return { approved: safeRows.length, skipped: rows.length - safeRows.length };
 }
 
 export async function getRawFileSignedUrl(storagePath, expiresIn = 300) {

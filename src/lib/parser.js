@@ -1,5 +1,6 @@
 import * as XLSX from 'xlsx';
 import { applyTfrsStandardMetadata, evaluateTfrsDataQuality } from './accountingStandards.js';
+import { enrichRowSemantics, runValidationEngine } from './accountingEngine.js';
 
 /**
  * Industry Import Parser v3 / Industry Parser Pack v1
@@ -1161,8 +1162,13 @@ export function parseFinancialWorkbook(workbook, companyId, fileName = '') {
   applyFileNameFiscalYearFallback(results, fileName);
   const filteredResults = removeOutOfWindowHistoricalRows(results);
   promoteRevenueFallback(filteredResults);
-  filteredResults.summary = makeSummary(filteredResults, workbook, fileName);
-  return filteredResults;
+  const semanticResults = filteredResults.map((row) => enrichRowSemantics(row));
+  const validation = runValidationEngine(semanticResults, { strictAnnual: false });
+  semanticResults.summary = makeSummary(semanticResults, workbook, fileName);
+  semanticResults.summary.accountingEngineVersion = 'ACCOUNTING_ENGINE_FOUNDATION_V1_9_0';
+  semanticResults.summary.validation = validation.results;
+  semanticResults.summary.validationPassed = validation.passed;
+  return semanticResults;
 }
 
 export async function parseFinancialFile(file, companyId) {

@@ -1,5 +1,6 @@
 import * as XLSX from 'xlsx';
 import { buildTfrsMappingReferenceRows, evaluateTfrsDataQuality, inferAccountingStandardProfile } from './accountingStandards.js';
+import { enrichRowSemantics, LINE_ROLES, runValidationEngine } from './accountingEngine.js';
 
 const n = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 const pick = (groups = {}, keys = []) => {
@@ -47,7 +48,7 @@ const FMT = {
 
 const TEXT = {
   th: {
-    cover: 'หน้าปก', summary: 'สรุป Dashboard', income: 'งบกำไรขาดทุน', balance: 'งบฐานะการเงิน', cashflow: 'งบกระแสเงินสด', ratios: 'อัตราส่วน', checks: 'ตรวจสอบงบ', mapping: 'Mapping Review', raw: 'Raw Data', lineage: 'Data Lineage', tfrs: 'TFRS Mapping Reference', quality: 'Data Quality',
+    cover: 'หน้าปก', summary: 'สรุป Dashboard', income: 'งบกำไรขาดทุน', balance: 'งบฐานะการเงิน', cashflow: 'งบกระแสเงินสด', ratios: 'อัตราส่วน', checks: 'ตรวจสอบงบ', mapping: 'Mapping Review', raw: 'Raw Data', lineage: 'Data Lineage', tfrs: 'TFRS Mapping Reference', quality: 'Data Quality', readiness: 'Readiness Gate',
     company: 'บริษัท', ticker: 'Ticker', period: 'ช่วงปี', generatedAt: 'เวลาส่งออก', mode: 'โหมดข้อมูล', unit: 'หน่วย', dataStatus: 'สถานะข้อมูล', warning: 'คำเตือน',
     latest: 'Latest confirmed', snapshot: 'Historical snapshot', archived: 'Archived snapshot',
     reviewWarning: 'ไฟล์นี้มีรายการ Mapping ที่ยังต้อง Review โปรดตรวจ Account Mapping Center ก่อนใช้ประกอบการตัดสินใจ',
@@ -61,7 +62,7 @@ const TEXT = {
     annualPeriodMissing: 'ไม่พบงบประจำปี FY — ระบบจะไม่นำ Q/M/period อื่นมาแทนโดยอัตโนมัติ',
   },
   en: {
-    cover: 'Cover', summary: 'Dashboard Summary', income: 'Income Statement', balance: 'Balance Sheet', cashflow: 'Cash Flow', ratios: 'Ratios', checks: 'Integrity Checks', mapping: 'Mapping Review', raw: 'Raw Data', lineage: 'Data Lineage', tfrs: 'TFRS Mapping Reference', quality: 'Data Quality',
+    cover: 'Cover', summary: 'Dashboard Summary', income: 'Income Statement', balance: 'Balance Sheet', cashflow: 'Cash Flow', ratios: 'Ratios', checks: 'Integrity Checks', mapping: 'Mapping Review', raw: 'Raw Data', lineage: 'Data Lineage', tfrs: 'TFRS Mapping Reference', quality: 'Data Quality', readiness: 'Readiness Gate',
     company: 'Company', ticker: 'Ticker', period: 'Period', generatedAt: 'Generated at', mode: 'Data mode', unit: 'Unit', dataStatus: 'Data status', warning: 'Warning',
     latest: 'Latest confirmed', snapshot: 'Historical snapshot', archived: 'Archived snapshot',
     reviewWarning: 'This export contains unreviewed accounting mappings. Review Account Mapping Center before decision use.',
@@ -121,7 +122,7 @@ function getAnnualSelection(store, companyId, year, { strictAnnual = true } = {}
 function buildStoreFromNormalizedRows(rows = [], importBatches = []) {
   const batchMeta = new Map((importBatches || []).map((batch) => [batch.id, batch]));
   const store = {};
-  (rows || []).forEach((record) => {
+  (rows || []).map((row) => enrichRowSemantics(row)).forEach((record) => {
     const companyId = record.company_id;
     const year = record.fiscal_year;
     if (!companyId || !year) return;
@@ -135,6 +136,7 @@ function buildStoreFromNormalizedRows(rows = [], importBatches = []) {
       groups: {},
       row_count: 0,
       review_count: 0,
+      semantic_warnings: [],
       import_batch_id: record.import_batch_id || batch.id || null,
       _statementScope: record.statement_scope || batch.statement_scope || null,
       _sourceFile: record.source_file || batch.file_name || null,
@@ -142,7 +144,17 @@ function buildStoreFromNormalizedRows(rows = [], importBatches = []) {
     };
     const target = store[companyId][year][periodKey];
     const groupKey = record.account_group || 'other';
-    target.groups[groupKey] = (target.groups[groupKey] || 0) + n(record.amount);
+    const role = record.line_role || 'detail';
+    const isTotalRole = [LINE_ROLES.TOTAL, LINE_ROLES.GRAND_TOTAL].includes(role);
+    const isIgnored = [LINE_ROLES.NOTE, LINE_ROLES.DISCLOSURE, LINE_ROLES.OCI, LINE_ROLES.ATTRIBUTION, LINE_ROLES.MOVEMENT].includes(role);
+    if (!isIgnored && record.is_export_eligible !== false) {
+      if (isTotalRole) {
+        target.groups[groupKey] = n(record.amount); // reported totals override detail sums to prevent double-counting
+      } else {
+        target.groups[groupKey] = (target.groups[groupKey] || 0) + n(record.amount);
+      }
+    }
+    if (Array.isArray(record.risk_flags) && record.risk_flags.length) target.semantic_warnings.push({ account: record.raw_account_name, flags: record.risk_flags });
     target.row_count += 1;
     if (record.needs_review) target.review_count += 1;
   });
@@ -372,7 +384,7 @@ function normalizeLineageRows(importBatches = []) {
 export function buildFinancialExcelWorkbook({
   company = {}, companyId, store = {}, years = [], importBatches = [],
   rawRows = [], normalizedRows = [], monthlyRows = [], trialBalanceRows = [], mappingRows = [], language = 'th', labelMode = 'bilingual',
-  unit = 'million', mode = 'latest', strictAnnual = true,
+  unit = 'million', mode = 'latest', strictAnnual = true, readinessRows = [], exportReason = '',
 } = {}) {
   const lang = language === 'en' ? 'en' : 'th';
   const th = lang === 'th';
@@ -386,6 +398,7 @@ export function buildFinancialExcelWorkbook({
   const hasImportantReview = reviewRows.length > 0;
   const profile = company.accountingStandardProfile || company.accounting_standard_profile || inferAccountingStandardProfile(company, {});
   const dataQuality = evaluateTfrsDataQuality(rawRows?.length ? rawRows : normalizedRows, { profile });
+  const accountingValidation = runValidationEngine(rawRows?.length ? rawRows : normalizedRows, { strictAnnual });
   const tfrsReferenceRows = buildTfrsMappingReferenceRows(rawRows?.length ? rawRows : normalizedRows);
   const hasTfrsQualityIssue = dataQuality.score < 80 || dataQuality.critical_review_rows > 0 || dataQuality.missing_core_metrics.length > 0;
   const { rows: integrityRows, anyFail: hasIntegrityIssue } = buildIntegrityRows(metricsByYear, actualYears, lang);
@@ -403,6 +416,8 @@ export function buildFinancialExcelWorkbook({
     [t.unit, UNIT_CONFIG[unit]?.[lang] || unit],
     ['Accounting standard profile', profile],
     ['Data Quality Score', `${dataQuality.score}/100`],
+    ['Readiness Gate', readinessRows?.length ? readinessRows.map((row) => `${row.fiscal_year || ''}: ${row.readiness_status || 'not_validated'} (${row.readiness_score ?? '-'})`).join(' | ') : 'not_validated'],
+    ...(exportReason ? [['Export anyway reason', exportReason]] : []),
     [t.dataStatus, hasImportantReview ? t.reviewWarning : t.clean],
     ...(hasIntegrityIssue ? [[t.warning, t.integrityWarn]] : []),
     ...(hasTfrsQualityIssue ? [[t.warning, t.tfrsQualityWarn]] : []),
@@ -451,6 +466,25 @@ export function buildFinancialExcelWorkbook({
     appendSheet(wb, integrityRows, t.checks, { fmtMap, freezeRow: 3 });
   }
 
+  appendJsonSheet(wb, (readinessRows || []).map((row) => ({
+    company: row.companies?.ticker_symbol || row.company_id,
+    file_name: row.file_name,
+    fiscal_year: row.fiscal_year,
+    period: row.period,
+    period_type: row.period_type,
+    statement_scope: row.statement_scope,
+    status: row.status,
+    readiness_status: row.readiness_status || 'not_validated',
+    readiness_score: row.readiness_score ?? null,
+    dashboard_ready: Boolean(row.dashboard_ready),
+    export_ready: Boolean(row.export_ready),
+    external_use_ready: Boolean(row.external_use_ready),
+    review_count: row.review_count,
+    total_rows: row.total_rows,
+    last_validated_at: row.last_validated_at,
+    export_reason: exportReason || '',
+  })), t.readiness || 'Readiness Gate');
+
   appendJsonSheet(wb, [{
     accounting_standard_profile: profile,
     data_quality_score: dataQuality.score,
@@ -459,6 +493,8 @@ export function buildFinancialExcelWorkbook({
     tfrs_referenced_rows: dataQuality.tfrs_referenced_rows,
     missing_core_metrics: dataQuality.missing_core_metrics.join(', '),
     critical_review_rows: dataQuality.critical_review_rows,
+    validation_passed: accountingValidation.passed,
+    validation_issues: accountingValidation.results.filter(r => !['pass','info'].includes(r.severity)).length,
     consolidation_signals: dataQuality.consolidation_signals.join(', '),
     business_combination_signals: dataQuality.business_combination_signals.join(', '),
   }], t.quality);
@@ -467,7 +503,7 @@ export function buildFinancialExcelWorkbook({
   appendJsonSheet(wb, normalizeRawRows(rawRows), t.raw);
   appendJsonSheet(wb, normalizeLineageRows(importBatches), t.lineage);
 
-  wb._integrity = { hasIntegrityIssue, hasImportantReview, hasTfrsQualityIssue, dataQuality };
+  wb._integrity = { hasIntegrityIssue, hasImportantReview, hasTfrsQualityIssue, dataQuality, accountingValidation };
   return wb;
 }
 

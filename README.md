@@ -461,3 +461,60 @@ Run this migration after v1.7.9:
 ```text
 supabase/migrations/202606230003_tfrs_standards_layer.sql
 ```
+
+## v1.9.0 — Accounting Engine Foundation
+
+This release upgrades FinAnalytics from row-level mapping into a standards-aware accounting engine.
+
+### Core changes
+
+- Added `src/lib/accountingEngine.js`.
+- Added semantic row classification:
+  - `line_role`: `detail`, `subtotal`, `total`, `grand_total`, `disclosure`, `attribution`, `movement`, `oci`, `note`, `derived`.
+  - `metric_role`: `dashboard_metric`, `supporting_line`, `presentation_line`, `validation_line`, `ignored_line`.
+  - `risk_flags`: subtotal/double-count guard, OCI risk, business-combination risk, consolidation-scope risk, critical metric review, sign anomalies.
+  - `mapping_status`: `suggested`, `draft_edited`, `approved`, `blocked`, `needs_manual_review`.
+- Added guarded bulk mapping approval:
+  - `Confirm Safe Suggestions` only approves high-confidence, low-risk detail lines.
+  - It blocks totals/subtotals, OCI, NCI, goodwill, business-combination items, unknown/other rows, and critical review rows.
+- Added grouped mapping workflow:
+  - Duplicate account labels across years are grouped by company, normalized account name, statement type, statement scope, standard profile, suggested group, and line role.
+- Added shared validation engine for parser/export/dashboard readiness.
+- Excel export now respects semantic rows and reported totals to avoid double-counting detail lines.
+
+### New migration
+
+Run this after v1.8.0 migration:
+
+```sql
+supabase/migrations/202606230004_accounting_engine_foundation.sql
+```
+
+The migration is idempotent and does not delete financial data.
+
+### Safety philosophy
+
+The system may suggest accounting mappings, but it does not treat parser/AI suggestions as approved mappings. Human approval is required for reusable mapping memory. Bulk approval is allowed only through the risk engine.
+
+## v1.9.1 — Dashboard / Export Readiness Gate
+
+This release connects the v1.9.0 Accounting Engine to the real workflow. It adds a batch-level readiness gate so Dashboard, Data Quality, Import History, and Excel Export can all speak from the same validation source.
+
+### New behavior
+
+- Batch readiness states: `not_ready`, `mapping_review_required`, `dashboard_ready`, `export_ready`, `external_use_ready`.
+- Data Quality page becomes a Control Room with Rebuild / Revalidate actions.
+- Import History shows readiness badge and readiness score for each batch.
+- Export Center checks readiness before download. If a batch is not Dashboard Ready or Export Ready, the user must enter an export-anyway reason.
+- Excel exports include a new `Readiness Gate` sheet and cover-level readiness summary.
+- Mapping approvals trigger best-effort readiness rebuild for affected batches.
+
+### Required migration
+
+Run this after v1.9.0 migrations:
+
+```text
+supabase/migrations/202606230005_readiness_gate.sql
+```
+
+The migration is idempotent and does not delete financial rows.

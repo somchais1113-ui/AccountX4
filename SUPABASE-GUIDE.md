@@ -351,3 +351,44 @@ It does not delete data and does not rewrite financial statement figures. Existi
 - otherwise → `UNKNOWN`
 
 The TFRS layer is then used by Parser, Mapping Center data, Data Quality scoring, and Excel Export reference sheets.
+
+## v1.9.0 SQL Migration
+
+After deploying v1.9.0 code, run:
+
+```text
+202606230004_accounting_engine_foundation.sql
+```
+
+This adds semantic accounting metadata and new guardrail tables:
+
+- `normalized_financial_data.line_role`
+- `normalized_financial_data.metric_role`
+- `normalized_financial_data.risk_flags`
+- `normalized_financial_data.mapping_status`
+- `normalized_financial_data.is_dashboard_eligible`
+- `normalized_financial_data.is_export_eligible`
+- `mapping_decisions`
+- `validation_results`
+- `financial_metrics_snapshots`
+
+The migration is safe/idempotent and does not delete data.
+
+## v1.9.1 SQL Migration
+
+If your database is already on v1.9.0, run only:
+
+```text
+202606230005_readiness_gate.sql
+```
+
+Recommended order for a fresh database upgrade from v1.8.0+:
+
+```text
+202606230002_export_security_hardening.sql
+202606230003_tfrs_standards_layer.sql
+202606230004_accounting_engine_foundation.sql
+202606230005_readiness_gate.sql
+```
+
+After deploying the app and running the SQL, open **Data Quality** and click **Rebuild / Revalidate Company** once. This backfills readiness metadata and generates validation results / financial metric snapshots for existing confirmed batches.

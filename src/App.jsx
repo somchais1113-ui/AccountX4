@@ -12,11 +12,12 @@ import {
   loadCompanies, createCompany, updateCompany, loadAllFinancialData, loadFinancialDataSnapshot, saveImportBatch, savePrivateImportBatch, loadExchangeRates, saveExchangeRate,
   loadAuditLog, loadCompanyMembers, grantCompanyAccess, revokeCompanyAccess,
   loadImportHistory, loadImportBatchRows, rollbackImportBatch, getRawFileSignedUrl,
-  loadMappingReviewRows, updateMappingForRawAccount,
+  loadMappingReviewRows, updateMappingForRawAccount, bulkApproveMappingRows, rebuildAccountingReadiness, loadAccountingReadiness, loadValidationResults, loadFinancialMetricSnapshots,
   loadAlertEvents, updateAlertEventStatus, loadLineAlertSettings, saveLineAlertSettings, createAlertEvent,
 } from "./lib/supabase.js";
 import ImportWizard from "./components/ImportWizard";
 import MomentumDashboard from "./components/Dashboard";
+import { groupMappingRows, summarizeMappingGroups, analyzeMappingRowSafety, detectAccountSubgroup, humanReadinessLabel } from "./lib/accountingEngine.js";
 
 // ═══════════════════════════════════════════════════════════
 // THEME SYSTEM — Dark / Light (realtime)
@@ -1622,7 +1623,7 @@ function ImportHistoryPage({ companyId, companies, onRefresh, onOpenDashboard, l
         {status.loading ? <div style={{padding:20}}>{th?"กำลังโหลด...":"Loading..."}</div> : status.error ? <div style={{padding:20,color:C.red}}>{status.error}</div> : (
           <div style={{overflowX:"auto"}}>
             <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:1100}}>
-              <thead><tr>{[th?"เวลา":"Time",th?"บริษัท":"Company",th?"ไฟล์":"File",th?"ปี":"Year",th?"ประเภท":"Type",th?"แถว":"Rows",th?"Review":"Review",th?"สถานะ":"Status",th?"ไฟล์ดิบ":"Raw",th?"จัดการ":"Actions"].map(h=><th key={h} style={{textAlign:"left",padding:11,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
+              <thead><tr>{[th?"เวลา":"Time",th?"บริษัท":"Company",th?"ไฟล์":"File",th?"ปี":"Year",th?"ประเภท":"Type",th?"แถว":"Rows",th?"Review":"Review",th?"Ready":"Ready",th?"Score":"Score",th?"สถานะ":"Status",th?"ไฟล์ดิบ":"Raw",th?"จัดการ":"Actions"].map(h=><th key={h} style={{textAlign:"left",padding:11,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
               <tbody>{rows.map(row => (
                 <tr key={row.id} style={{borderBottom:`1px solid ${C.border}`}}>
                   <td style={{padding:11,color:C.muted}}>{row.imported_at ? new Date(row.imported_at).toLocaleString(th?"th-TH":"en-GB") : "-"}</td>
@@ -1632,6 +1633,8 @@ function ImportHistoryPage({ companyId, companies, onRefresh, onOpenDashboard, l
                   <td style={{padding:11,color:C.muted}}>{row.source_type || row.period_type || "-"}</td>
                   <td style={{padding:11,textAlign:"right"}}>{Number(row.total_rows || 0).toLocaleString()}</td>
                   <td style={{padding:11,textAlign:"right",color:Number(row.review_count)>0?C.amber:C.green}}>{row.review_count ?? 0}</td>
+                  <td style={{padding:11}}><Badge color={row.export_ready?C.green:row.dashboard_ready?C.blue:row.readiness_status==='mapping_review_required'?C.amber:C.red}>{humanReadinessLabel(row.readiness_status, lang)}</Badge></td>
+                  <td style={{padding:11,fontWeight:950,color:Number(row.readiness_score||0)>=90?C.green:Number(row.readiness_score||0)>=70?C.amber:C.red}}>{row.readiness_score ?? '-'}</td>
                   <td style={{padding:11}}><Badge color={statusColor(row.status)}>{row.status || "confirmed"}</Badge></td>
                   <td style={{padding:11}}>{row.storage_path ? <button onClick={()=>downloadRaw(row)} style={{border:"none",background:C.blueLo,color:C.blue,borderRadius:8,padding:"7px 9px",cursor:"pointer"}}>{formatSize(row.file_size)}</button> : <span style={{color:C.muted}}>-</span>}</td>
                   <td style={{padding:11,display:"flex",gap:8,flexWrap:"wrap"}}>
@@ -1658,6 +1661,11 @@ function ImportHistoryPage({ companyId, companies, onRefresh, onOpenDashboard, l
                 <div style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:10,padding:12}}><b>{details.monthly.length}</b><div style={{fontSize:12,color:C.muted}}>monthly rows</div></div>
                 <div style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:10,padding:12}}><b>{details.trialBalance.length}</b><div style={{fontSize:12,color:C.muted}}>trial balance rows</div></div>
               </div>
+              <div style={{display:'flex',gap:10,flexWrap:'wrap',marginBottom:14}}>
+                <Badge color={selected.export_ready?C.green:selected.dashboard_ready?C.blue:C.amber}>{humanReadinessLabel(selected.readiness_status, lang)}</Badge>
+                <Badge color={Number(selected.readiness_score||0)>=90?C.green:Number(selected.readiness_score||0)>=70?C.amber:C.red}>Score {selected.readiness_score ?? '-'}</Badge>
+                <span style={{fontSize:12,color:C.muted}}>{selected.last_validated_at ? `${th?'ตรวจล่าสุด':'Last validated'} ${new Date(selected.last_validated_at).toLocaleString(th?'th-TH':'en-GB')}` : (th?'ยังไม่ได้ตรวจ readiness':'Not validated yet')}</span>
+              </div>
               <div style={{overflowX:"auto",maxHeight:360}}>
                 <table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:800}}>
                   <thead><tr>{["Year","Statement","Raw Account","Group","Amount","Source"].map(h=><th key={h} style={{textAlign:"left",padding:8,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
@@ -1672,45 +1680,132 @@ function ImportHistoryPage({ companyId, companies, onRefresh, onOpenDashboard, l
   );
 }
 
-function DataQualityPage({ store, companyId, lang }) {
+function DataQualityPage({ store, companyId, companies = [], lang }) {
   const C = useC();
   const th = lang === "th";
-  const company = COMPANIES.find(c=>c.id===companyId);
-  const annualRows = DataEngine.getAnnualRows(store, companyId);
-  const validations = annualRows.map(row => {
-    const balanceDiff = Math.abs((row.liability + row.equity) - row.asset);
-    const balanceBase = Math.max(Math.abs(row.asset), 1);
-    const balanceOk = balanceDiff / balanceBase < 0.01;
-    const marginOk = !row.revenue || Math.abs(row.margin) < 100;
-    const cfoOk = Number.isFinite(row.operatingCashFlow);
-    return { year: row.year, balanceDiff, balanceOk, marginOk, cfoOk, pass: [balanceOk, marginOk, cfoOk].filter(Boolean).length, total: 3, row };
-  });
-  const totalPass = validations.reduce((s,v)=>s+v.pass,0);
-  const totalChecks = validations.reduce((s,v)=>s+v.total,0);
-  const score = totalChecks ? Math.round((totalPass/totalChecks)*100) : 0;
-  const color = score >= 90 ? C.green : score >= 70 ? C.amber : C.red;
+  const [rows, setRows] = useState([]);
+  const [validationRows, setValidationRows] = useState([]);
+  const [metricRows, setMetricRows] = useState([]);
+  const [status, setStatus] = useState({ loading: true, error: "", ok: "" });
+  const [busyId, setBusyId] = useState(null);
+  const company = companies.find(c => Number(c.id) === Number(companyId)) || COMPANIES.find(c=>Number(c.id)===Number(companyId));
+
+  const load = async () => {
+    if (!isSupabaseConfigured) { setStatus({ loading:false, error: th ? "ต้องเชื่อม Supabase ก่อน" : "Supabase is required", ok:"" }); return; }
+    setStatus({ loading:true, error:"", ok:"" });
+    try {
+      const [readiness, validations, metrics] = await Promise.all([
+        loadAccountingReadiness(companyId || null, 300),
+        loadValidationResults({ companyId: companyId || null, limit: 500 }),
+        loadFinancialMetricSnapshots({ companyId: companyId || null, limit: 2000 }),
+      ]);
+      setRows(readiness);
+      setValidationRows(validations);
+      setMetricRows(metrics);
+      setStatus({ loading:false, error:"", ok:"" });
+    } catch (error) {
+      setStatus({ loading:false, error:error.message || String(error), ok:"" });
+    }
+  };
+  useEffect(() => { load(); }, [companyId, lang]);
+
+  const rebuild = async (row = null) => {
+    setBusyId(row?.id || 'all');
+    try {
+      await rebuildAccountingReadiness({ companyId: row?.company_id || companyId || null, batchId: row?.id || null, strictAnnual: true });
+      await load();
+      setStatus({ loading:false, error:"", ok: th ? "Rebuild Metrics / Validation สำเร็จ" : "Metrics and validation rebuilt." });
+    } catch (error) {
+      setStatus({ loading:false, error:error.message || String(error), ok:"" });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const confirmedRows = rows.filter((r) => r.status === 'confirmed');
+  const avgScore = confirmedRows.length ? Math.round(confirmedRows.reduce((sum, r) => sum + Number(r.readiness_score || 0), 0) / confirmedRows.length) : 0;
+  const dashboardReady = confirmedRows.filter((r) => r.dashboard_ready).length;
+  const exportReady = confirmedRows.filter((r) => r.export_ready).length;
+  const blockingValidation = validationRows.filter((r) => ['blocking', 'error'].includes(r.severity)).length;
+  const warnings = validationRows.filter((r) => r.severity === 'warning').length;
+  const scoreColor = avgScore >= 90 ? C.green : avgScore >= 70 ? C.amber : C.red;
+  const readinessColor = (row) => row.export_ready ? C.green : row.dashboard_ready ? C.blue : row.readiness_status === 'mapping_review_required' ? C.amber : C.red;
+
+  const latestMetricYears = [...new Set(metricRows.map((m) => m.fiscal_year).filter(Boolean))].sort((a,b)=>b-a).slice(0,5);
+
   return (
     <div>
-      <PageHeader title={th?"คุณภาพข้อมูล":"Data Quality"} subtitle={th?"ตรวจสมการงบและความสมเหตุสมผลก่อนใช้วิเคราะห์":"Accounting validation checks before analysis"}/>
-      <div className="responsive-grid-3" style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:16}}>
-        <Card><div style={{fontSize:12,color:C.muted,fontWeight:800}}>Data Quality Score</div><div style={{fontSize:30,fontWeight:900,color}}>{score}%</div></Card>
-        <Card><div style={{fontSize:12,color:C.muted,fontWeight:800}}>{th?"ปีที่ตรวจ":"Years checked"}</div><div style={{fontSize:30,fontWeight:900}}>{validations.length}</div></Card>
-        <Card><div style={{fontSize:12,color:C.muted,fontWeight:800}}>{th?"บริษัท":"Company"}</div><div style={{fontSize:16,fontWeight:900}}>{company?.tickerSymbol || company?.nameTh || '-'}</div></Card>
+      <PageHeader title={th?"คุณภาพข้อมูล / Readiness Gate":"Data Quality / Readiness Gate"} subtitle={th?"Control Room สำหรับตรวจว่า Dashboard และ Export ใช้งานได้หรือยัง":"Control room for Dashboard Ready / Export Ready / External Use readiness"}/>
+      <div className="responsive-grid-3" style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:16}}>
+        <Card><div style={{fontSize:12,color:C.muted,fontWeight:800}}>Readiness Score</div><div style={{fontSize:30,fontWeight:900,color:scoreColor}}>{avgScore}%</div></Card>
+        <Card><div style={{fontSize:12,color:C.muted,fontWeight:800}}>Dashboard Ready</div><div style={{fontSize:30,fontWeight:900,color:dashboardReady?C.blue:C.muted}}>{dashboardReady}/{confirmedRows.length}</div></Card>
+        <Card><div style={{fontSize:12,color:C.muted,fontWeight:800}}>Export Ready</div><div style={{fontSize:30,fontWeight:900,color:exportReady?C.green:C.muted}}>{exportReady}/{confirmedRows.length}</div></Card>
+        <Card><div style={{fontSize:12,color:C.muted,fontWeight:800}}>{th?"Validation Issues":"Validation Issues"}</div><div style={{fontSize:30,fontWeight:900,color:blockingValidation?C.red:warnings?C.amber:C.green}}>{blockingValidation}/{warnings}</div><div style={{fontSize:11,color:C.muted}}>error / warning</div></Card>
       </div>
-      <Card style={{padding:0,overflow:"hidden"}}>
-        <div style={{overflowX:"auto"}}>
-          <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:900}}>
-            <thead><tr>{[th?"ปี":"Year","Balance Sheet","Net Margin","Cash Flow","Diff"].map(h=><th key={h} style={{textAlign:"left",padding:12,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
-            <tbody>{validations.map(v=><tr key={v.year} style={{borderBottom:`1px solid ${C.border}`}}>
-              <td style={{padding:12,fontWeight:900}}>FY {v.year}</td>
-              <td style={{padding:12,color:v.balanceOk?C.green:C.red}}>{v.balanceOk?"✓":"⚠"} {th?"สินทรัพย์ = หนี้สิน + ทุน":"Assets = Liabilities + Equity"}</td>
-              <td style={{padding:12,color:v.marginOk?C.green:C.amber}}>{v.marginOk?"✓":"⚠"} {v.row.margin.toFixed(1)}%</td>
-              <td style={{padding:12,color:v.cfoOk?C.green:C.red}}>{v.cfoOk?"✓":"⚠"} CFO</td>
-              <td style={{padding:12,textAlign:"right"}}>{fmt(v.balanceDiff, company?.currency || 'THB', true)}</td>
-            </tr>)}</tbody>
-          </table>
+
+      <Card style={{marginBottom:16,border:`1px solid ${exportReady===confirmedRows.length && confirmedRows.length ? C.green : C.amber}`}}>
+        <div style={{display:"flex",justifyContent:"space-between",gap:16,alignItems:"center",flexWrap:"wrap"}}>
+          <div>
+            <div style={{fontSize:18,fontWeight:950,color:C.white}}>{th?"สถานะข้อมูลสำหรับใช้งานจริง":"Operational Readiness"}</div>
+            <div style={{fontSize:13,color:C.muted,lineHeight:1.7,marginTop:4}}>
+              {th?"Dashboard และ Excel Export จะเชื่อถือได้ก็ต่อเมื่อผ่าน Accounting Engine, Validation Results และ Financial Metrics Snapshot ชุดเดียวกัน":"Dashboard and Excel Export should use the same Accounting Engine, Validation Results, and Financial Metrics Snapshot."}
+            </div>
+          </div>
+          <button onClick={()=>rebuild(null)} disabled={busyId==='all'} style={{border:0,borderRadius:10,padding:"10px 14px",fontWeight:900,cursor:busyId==='all'?"wait":"pointer",background:C.accent,color:'#fff'}}>{busyId==='all'?(th?"กำลังตรวจ...":"Rebuilding..."):(th?"Rebuild / Revalidate ทั้งบริษัท":"Rebuild / Revalidate Company")}</button>
         </div>
       </Card>
+
+      {status.error ? <div style={{marginBottom:12,color:C.red,fontWeight:800}}>{status.error}</div> : null}
+      {status.ok ? <div style={{marginBottom:12,color:C.green,fontWeight:800}}>{status.ok}</div> : null}
+      {status.loading ? <Card>{th?"กำลังโหลด...":"Loading..."}</Card> : (
+        <>
+          <Card style={{padding:0,overflow:"hidden",marginBottom:16}}>
+            <div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:1180}}>
+                <thead><tr>{[th?"บริษัท":"Company",th?"ไฟล์":"File",th?"ปี":"Year",th?"Scope":"Scope",th?"Score":"Score",th?"Readiness":"Readiness",th?"Dashboard":"Dashboard",th?"Export":"Export",th?"Review":"Review",th?"Validated":"Validated",th?"จัดการ":"Action"].map(h=><th key={h} style={{textAlign:"left",padding:11,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
+                <tbody>{rows.map(row => (
+                  <tr key={row.id} style={{borderBottom:`1px solid ${C.border}`}}>
+                    <td style={{padding:11,fontWeight:900}}>{row.companies?.ticker_symbol || company?.tickerSymbol || row.company_id}</td>
+                    <td style={{padding:11,maxWidth:280,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}} title={row.file_name}>{row.file_name}</td>
+                    <td style={{padding:11}}>{row.fiscal_year || '-'}</td>
+                    <td style={{padding:11,color:C.muted}}>{row.statement_scope || '-'}</td>
+                    <td style={{padding:11,fontWeight:950,color:row.readiness_score>=90?C.green:row.readiness_score>=70?C.amber:C.red}}>{row.readiness_score ?? '-'}</td>
+                    <td style={{padding:11}}><Badge color={readinessColor(row)}>{humanReadinessLabel(row.readiness_status, lang)}</Badge></td>
+                    <td style={{padding:11,color:row.dashboard_ready?C.green:C.amber}}>{row.dashboard_ready?'✓':'⚠'}</td>
+                    <td style={{padding:11,color:row.export_ready?C.green:C.red}}>{row.export_ready?'✓':'Blocked'}</td>
+                    <td style={{padding:11,textAlign:"right",color:Number(row.review_count)>0?C.amber:C.green}}>{row.review_count ?? 0}</td>
+                    <td style={{padding:11,color:C.muted}}>{row.last_validated_at ? new Date(row.last_validated_at).toLocaleString(th?'th-TH':'en-GB') : '-'}</td>
+                    <td style={{padding:11}}><button onClick={()=>rebuild(row)} disabled={busyId===row.id} style={{border:0,borderRadius:8,padding:"7px 10px",fontWeight:800,cursor:busyId===row.id?'wait':'pointer',background:C.blueLo,color:C.blue}}>{busyId===row.id?(th?'กำลังตรวจ':'Checking'):(th?'Re-run':'Re-run')}</button></td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+          </Card>
+
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+            <Card>
+              <div style={{fontSize:16,fontWeight:950,color:C.white,marginBottom:10}}>{th?"Validation Results ล่าสุด":"Latest Validation Results"}</div>
+              <div style={{display:"grid",gap:8,maxHeight:360,overflowY:"auto"}}>
+                {validationRows.slice(0,40).map((r)=><div key={r.id} style={{padding:10,borderRadius:10,background:C.bg,border:`1px solid ${C.border}`}}>
+                  <div style={{display:"flex",justifyContent:"space-between",gap:12}}><b>{r.validation_type}</b><span style={{color:r.severity==='error'||r.severity==='blocking'?C.red:r.severity==='warning'?C.amber:C.green,fontWeight:900}}>{r.severity}</span></div>
+                  <div style={{fontSize:12,color:C.muted,marginTop:4}}>FY {r.fiscal_year || '-'} · {r.statement_scope || '-'} · {r.message || '-'}</div>
+                </div>)}
+                {!validationRows.length ? <div style={{color:C.muted}}>{th?"ยังไม่มี validation results ให้กด Rebuild / Revalidate ก่อน":"No validation results yet. Click Rebuild / Revalidate first."}</div> : null}
+              </div>
+            </Card>
+            <Card>
+              <div style={{fontSize:16,fontWeight:950,color:C.white,marginBottom:10}}>{th?"Financial Metrics Snapshots":"Financial Metrics Snapshots"}</div>
+              <div style={{fontSize:13,color:C.muted,marginBottom:10}}>{th?"ปีล่าสุดที่มี snapshot":"Latest snapshot years"}: {latestMetricYears.join(', ') || '-'}</div>
+              <div style={{display:"grid",gap:8,maxHeight:360,overflowY:"auto"}}>
+                {metricRows.slice(0,45).map((m)=><div key={m.id} style={{display:"grid",gridTemplateColumns:"110px 1fr 110px",gap:8,padding:10,borderRadius:10,background:C.bg,border:`1px solid ${C.border}`,fontSize:12}}>
+                  <div style={{fontWeight:900}}>FY {m.fiscal_year}</div><div>{m.metric_key}</div><div style={{textAlign:'right',fontWeight:900}}>{Number(m.metric_value||0).toLocaleString()}</div>
+                </div>)}
+                {!metricRows.length ? <div style={{color:C.muted}}>{th?"ยังไม่มี metrics snapshot":"No metric snapshots yet."}</div> : null}
+              </div>
+            </Card>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -1719,16 +1814,21 @@ function MappingCenterPage({ companyId, lang, onRefresh }) {
   const C = useC();
   const th = lang === "th";
   const [rows, setRows] = useState([]);
-  const [status, setStatus] = useState({loading:true,error:""});
+  const [status, setStatus] = useState({ loading: true, error: "" });
   const [savingId, setSavingId] = useState(null);
+  const [bulkSaving, setBulkSaving] = useState(false);
   const [draftGroups, setDraftGroups] = useState({});
+  const [selectedGroupKeys, setSelectedGroupKeys] = useState({});
+  const [viewMode, setViewMode] = useState('groups');
+  const [riskFilter, setRiskFilter] = useState('all');
+
   const extraGroups = [
     'gross_profit','sales_revenue','product_sales_revenue','service_revenue','other_income','finance_income','dividend_income',
-    'cogs','sga','expense','finance_cost','tax','net_profit','profit_before_tax','operating_profit',
+    'cogs','sga','expense','finance_cost','tax','oci_tax','net_profit','profit_before_tax','operating_profit',
     'asset','liability','equity','cash','inventory','receivable','payable','loan',
     'deferred_tax_assets','deferred_tax_liabilities','legal_reserve','retained_earnings','share_capital','share_premium',
     'other_comprehensive_income','total_comprehensive_income','oci_cash_flow_hedge','non_controlling_interests',
-    'operating_cash_flow','investing_cash_flow','financing_cash_flow','other'
+    'operating_cash_flow','investing_cash_flow','financing_cash_flow','goodwill','gain_on_bargain_purchase','other'
   ];
   const groupOptions = Array.from(new Set([
     ...Object.values(METRIC_GROUPS).flat(),
@@ -1736,20 +1836,27 @@ function MappingCenterPage({ companyId, lang, onRefresh }) {
     ...rows.map(row => row.account_group).filter(Boolean),
     ...rows.map(row => row.suggested_account_group).filter(Boolean),
   ])).sort();
+
   const load = async () => {
-    if (!isSupabaseConfigured) { setStatus({loading:false,error:th?"ต้องเชื่อม Supabase ก่อน":"Supabase is required"}); return; }
-    setStatus({loading:true,error:""});
+    if (!isSupabaseConfigured) { setStatus({ loading: false, error: th ? "ต้องเชื่อม Supabase ก่อน" : "Supabase is required" }); return; }
+    setStatus({ loading: true, error: "" });
     try {
-      const nextRows = await loadMappingReviewRows(companyId, 500);
+      const nextRows = await loadMappingReviewRows(companyId, 1000);
       setRows(nextRows);
       const initialDrafts = {};
       nextRows.forEach(row => { initialDrafts[row.id] = row.suggested_account_group || row.account_group || 'other'; });
       setDraftGroups(initialDrafts);
-      setStatus({loading:false,error:""});
-    }
-    catch(error){ setStatus({loading:false,error:error.message}); }
+      setSelectedGroupKeys({});
+      setStatus({ loading: false, error: "" });
+    } catch (error) { setStatus({ loading: false, error: error.message }); }
   };
-  useEffect(()=>{ load(); },[companyId,lang]);
+  useEffect(() => { load(); }, [companyId, lang]);
+
+  const groupedRows = useMemo(() => groupMappingRows(rows, draftGroups), [rows, draftGroups]);
+  const summary = useMemo(() => summarizeMappingGroups(groupedRows), [groupedRows]);
+  const filteredGroups = useMemo(() => groupedRows.filter((group) => riskFilter === 'all' || group.risk_level === riskFilter || (riskFilter === 'safe' && group.safe_to_bulk_confirm)), [groupedRows, riskFilter]);
+  const selectedGroups = filteredGroups.filter((group) => selectedGroupKeys[group.key]);
+
   const sourceLabel = (source) => ({
     approved_mapping: th ? 'Approved' : 'Approved',
     accounting_dictionary: th ? 'Dictionary' : 'Dictionary',
@@ -1764,53 +1871,156 @@ function MappingCenterPage({ companyId, lang, onRefresh }) {
     parser_rule: C.accent,
     unknown: C.red,
   }[source || 'unknown'] || C.muted);
+  const riskColor = (risk) => ({ low: C.green, medium: C.amber, high: C.red }[risk] || C.muted);
+  const roleColor = (role) => ({ detail: C.green, total: C.amber, grand_total: C.amber, subtotal: C.amber, oci: C.purple, disclosure: C.muted, movement: C.blue, attribution: C.purple }[role] || C.muted);
+  const statusColor = (statusValue) => ({ approved: C.green, suggested: C.amber, needs_manual_review: C.red, blocked: C.red, draft_edited: C.blue }[statusValue] || C.muted);
+
+  const applyDraftToGroup = (group, nextGroup) => {
+    const next = { ...draftGroups };
+    group.rows.forEach(row => { next[row.id] = nextGroup; });
+    setDraftGroups(next);
+  };
+
   const save = async (row) => {
     const group = draftGroups[row.id] || row.suggested_account_group || row.account_group || 'other';
+    const safety = analyzeMappingRowSafety(row, group);
+    const subgroup = row.suggested_account_subgroup || row.account_subgroup || safety.adjusted.account_subgroup || detectAccountSubgroup(row.raw_account_name || row.account_name, group) || group;
     setSavingId(row.id);
     try {
-      await updateMappingForRawAccount({ companyId: row.company_id, rawAccountName: row.raw_account_name, statementType: row.statement_type, accountGroup: group, accountSubgroup: row.suggested_account_subgroup || row.account_subgroup || group });
+      await updateMappingForRawAccount({
+        companyId: row.company_id,
+        rawAccountName: row.raw_account_name,
+        statementType: row.statement_type,
+        accountGroup: group,
+        accountSubgroup: subgroup,
+        statementScope: row.statement_scope || null,
+        accountingStandardProfile: row.accounting_standard_profile || null,
+        lineRole: safety.lineRole || row.line_role || null,
+        approvalScope: 'single_row',
+      });
       await load(); await onRefresh?.();
-    } catch(error) { alert(error.message); }
+    } catch (error) { alert(error.message); }
     finally { setSavingId(null); }
   };
+
+  const saveGroup = async (group) => {
+    setSavingId(group.key);
+    try {
+      for (const row of group.rows) await save(row);
+    } finally {
+      setSavingId(null);
+    }
+  };
+
+  const confirmSafe = async () => {
+    const safeRows = groupedRows.filter(g => g.safe_to_bulk_confirm).flatMap(g => g.rows);
+    if (!safeRows.length) { alert(th ? 'ยังไม่มีรายการที่ปลอดภัยสำหรับ Bulk Confirm' : 'No safe suggestions available for bulk confirm.'); return; }
+    const ok = window.confirm(th ? `ระบบจะ Confirm เฉพาะรายการที่ปลอดภัย ${safeRows.length} แถว\nไม่รวม total/subtotal, OCI, NCI, goodwill, Other, และรายการเสี่ยง\nต้องการดำเนินการต่อหรือไม่?` : `Confirm ${safeRows.length} safe rows only?\nThis excludes total/subtotal, OCI, NCI, goodwill, Other, and risky rows.`);
+    if (!ok) return;
+    setBulkSaving(true);
+    try {
+      const result = await bulkApproveMappingRows({ rows: safeRows, selectedGroups: draftGroups, approvalScope: 'bulk_safe_confirm' });
+      alert(th ? `ยืนยันแล้ว ${result.approved} แถว / ข้าม ${result.skipped} แถว` : `Approved ${result.approved} rows / skipped ${result.skipped}`);
+      await load(); await onRefresh?.();
+    } catch (error) { alert(error.message); }
+    finally { setBulkSaving(false); }
+  };
+
+  const confirmSelected = async () => {
+    const candidateRows = selectedGroups.flatMap(group => group.rows);
+    if (!candidateRows.length) return;
+    const unsafe = candidateRows.filter(row => !analyzeMappingRowSafety(row, draftGroups[row.id]).safe).length;
+    const ok = window.confirm(th ? `เลือกไว้ ${candidateRows.length} แถว มีรายการที่ไม่เข้าเกณฑ์ safe ${unsafe} แถว\nระบบจะ Confirm เฉพาะแถวที่ safe เท่านั้น ต้องการดำเนินการต่อหรือไม่?` : `${candidateRows.length} rows selected. ${unsafe} are not safe. Only safe rows will be confirmed.`);
+    if (!ok) return;
+    setBulkSaving(true);
+    try {
+      const result = await bulkApproveMappingRows({ rows: candidateRows, selectedGroups: draftGroups, approvalScope: 'bulk_selected_safe_confirm' });
+      alert(th ? `ยืนยันแล้ว ${result.approved} แถว / ข้าม ${result.skipped} แถว` : `Approved ${result.approved} rows / skipped ${result.skipped}`);
+      await load(); await onRefresh?.();
+    } catch (error) { alert(error.message); }
+    finally { setBulkSaving(false); }
+  };
+
   return (
     <div>
-      <PageHeader title={th?"Account Mapping Center":"Account Mapping Center"} subtitle={th?"AI ช่วยเสนอหมวดบัญชีให้ แต่ทุกแถวที่ไม่ใช่ approved mapping ต้องกดยืนยันก่อนนำไปจำใช้ครั้งต่อไป":"AI can suggest accounting categories, but non-approved suggestions require human confirmation"}/>
+      <PageHeader title={th ? "Account Mapping Center" : "Account Mapping Center"} subtitle={th ? "ตรวจ Mapping แบบกลุ่ม พร้อม Risk Engine, TFRS reason, และ Bulk Confirm ที่ปลอดภัย" : "Grouped mapping review with risk engine, TFRS reasons, and guarded bulk approval"}/>
+
       <Card style={{padding:16,marginBottom:16,border:`1px solid ${C.amber}`}}>
-        <div style={{fontWeight:900,color:C.amber,marginBottom:6}}>⚠ {th?"หลักความปลอดภัยของ Mapping":"Mapping safety rule"}</div>
+        <div style={{fontWeight:900,color:C.amber,marginBottom:6}}>⚠ {th ? "หลักความปลอดภัยของ Mapping" : "Mapping safety rule"}</div>
         <div style={{color:C.muted,fontSize:13,lineHeight:1.6}}>
-          {th?"ระบบสามารถ auto-select หมวดที่แนะนำไว้ใน dropdown ได้ แต่จะยังถือเป็น Review จนกว่าคุณจะกด Confirm / Approve เอง หลังอนุมัติแล้วระบบจึงจำเป็น approved mapping สำหรับไฟล์รอบถัดไป":"The system may preselect a suggested category in the dropdown, but it remains under Review until you click Confirm / Approve. After approval, it becomes a reusable approved mapping for future imports."}
+          {th ? "ระบบจะ group รายการซ้ำหลายปีให้ และอนุญาต Bulk Confirm เฉพาะรายการ detail ที่ confidence สูงและไม่มี risk flag เท่านั้น รายการ total/subtotal, OCI, NCI, goodwill, business combination, Other และ critical review ต้องตรวจเอง" : "Rows are grouped across years. Bulk approval is allowed only for high-confidence detail lines with no risk flags. Total/subtotal, OCI, NCI, goodwill, business combination, Other, and critical review rows remain manual."}
         </div>
       </Card>
+
+      <div style={{display:'grid',gridTemplateColumns:'repeat(5,minmax(120px,1fr))',gap:12,marginBottom:16}}>
+        <Card style={{padding:14}}><div style={{color:C.muted,fontSize:12}}>Groups</div><div style={{fontSize:24,fontWeight:900}}>{summary.total_groups}</div></Card>
+        <Card style={{padding:14}}><div style={{color:C.muted,fontSize:12}}>Safe rows</div><div style={{fontSize:24,fontWeight:900,color:C.green}}>{summary.safe_rows}</div></Card>
+        <Card style={{padding:14}}><div style={{color:C.muted,fontSize:12}}>Safe groups</div><div style={{fontSize:24,fontWeight:900,color:C.green}}>{summary.safe_groups}</div></Card>
+        <Card style={{padding:14}}><div style={{color:C.muted,fontSize:12}}>Medium risk</div><div style={{fontSize:24,fontWeight:900,color:C.amber}}>{summary.medium_risk_groups}</div></Card>
+        <Card style={{padding:14}}><div style={{color:C.muted,fontSize:12}}>High risk</div><div style={{fontSize:24,fontWeight:900,color:C.red}}>{summary.high_risk_groups}</div></Card>
+      </div>
+
+      <Card style={{padding:14,marginBottom:16,display:'flex',gap:10,alignItems:'center',flexWrap:'wrap'}}>
+        <button onClick={confirmSafe} disabled={bulkSaving || summary.safe_rows === 0} style={{background:C.green,color:'#06130F',border:0,borderRadius:10,padding:'10px 14px',fontWeight:900,cursor:'pointer'}}>{bulkSaving ? (th?'กำลังบันทึก...':'Saving...') : (th?'✅ Confirm Safe Suggestions':'✅ Confirm Safe Suggestions')}</button>
+        <button onClick={confirmSelected} disabled={bulkSaving || selectedGroups.length === 0} style={{background:C.accent,color:'#fff',border:0,borderRadius:10,padding:'10px 14px',fontWeight:900,cursor:'pointer'}}>{th?'☑ Confirm Selected Safe':'☑ Confirm Selected Safe'}</button>
+        <button onClick={()=>setViewMode(viewMode === 'groups' ? 'rows' : 'groups')} style={{background:C.card,color:C.text,border:`1px solid ${C.border}`,borderRadius:10,padding:'10px 14px',fontWeight:900,cursor:'pointer'}}>{viewMode === 'groups' ? (th?'ดูรายแถว':'Row view') : (th?'ดูแบบกลุ่ม':'Group view')}</button>
+        <select value={riskFilter} onChange={(e)=>setRiskFilter(e.target.value)} style={{background:C.bg,color:C.text,border:`1px solid ${C.border}`,borderRadius:10,padding:'10px 14px',fontWeight:800}}>
+          <option value="all">All risk</option><option value="safe">Safe only</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option>
+        </select>
+      </Card>
+
       <Card style={{padding:0,overflow:"hidden"}}>
-        {status.loading ? <div style={{padding:20}}>{th?"กำลังโหลด...":"Loading..."}</div> : status.error ? <div style={{padding:20,color:C.red}}>{status.error}</div> : rows.length === 0 ? <div style={{padding:24,textAlign:"center",color:C.green,fontWeight:900}}>{th?"ไม่มีรายการที่ต้องแก้ไข":"No mapping issues found"}</div> : (
+        {status.loading ? <div style={{padding:20}}>{th?"กำลังโหลด...":"Loading..."}</div> : status.error ? <div style={{padding:20,color:C.red}}>{status.error}</div> : rows.length === 0 ? <div style={{padding:24,textAlign:"center",color:C.green,fontWeight:900}}>{th?"ไม่มีรายการที่ต้องแก้ไข":"No mapping issues found"}</div> : viewMode === 'groups' ? (
           <div style={{overflowX:"auto"}}>
-            <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:1220}}>
-              <thead><tr>{[th?"สถานะ":"Status",th?"บริษัท":"Company",th?"ปี":"Year",th?"งบ":"Statement",th?"ชื่อบัญชีจากไฟล์":"Raw account",th?"Source":"Source",th?"Confidence":"Confidence",th?"AI/Suggested category":"AI/Suggested category",th?"Confirm":"Confirm"].map(h=><th key={h} style={{textAlign:"left",padding:11,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:1500}}>
+              <thead><tr>{['', th?'บัญชี / Group':'Account / Group', th?'ปี':'Years', th?'งบ':'Statement', 'Line role', 'Risk', 'Confidence', 'Standard', th?'Suggested category':'Suggested category', th?'Action':'Action'].map(h=><th key={h} style={{textAlign:"left",padding:11,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
+              <tbody>{filteredGroups.map(group => <tr key={group.key} style={{borderBottom:`1px solid ${C.border}`,background:group.safe_to_bulk_confirm ? 'transparent' : (group.risk_level === 'high' ? C.redLo : C.amberLo)}}>
+                <td style={{padding:11}}><input type="checkbox" checked={Boolean(selectedGroupKeys[group.key])} onChange={(e)=>setSelectedGroupKeys(prev=>({...prev,[group.key]:e.target.checked}))}/></td>
+                <td style={{padding:11,fontWeight:800,maxWidth:360}}>
+                  <div>{group.raw_account_name}</div>
+                  <div style={{color:C.muted,fontSize:11,marginTop:4}}>{group.row_count} rows • {group.source_files.slice(0,2).join(', ')}</div>
+                  {group.risk_flags.length ? <div style={{marginTop:6,display:'flex',gap:5,flexWrap:'wrap'}}>{group.risk_flags.map(flag=><Badge key={flag} color={riskColor(group.risk_level)}>{flag}</Badge>)}</div> : null}
+                </td>
+                <td style={{padding:11}}>{group.years.join(', ')}</td>
+                <td style={{padding:11,color:C.muted}}>{group.statement_type}<div style={{fontSize:11}}>{group.statement_scope}</div></td>
+                <td style={{padding:11}}><Badge color={roleColor(group.line_role)}>{group.line_role}</Badge></td>
+                <td style={{padding:11}}><Badge color={riskColor(group.risk_level)}>{group.safe_to_bulk_confirm ? 'safe' : group.risk_level}</Badge></td>
+                <td style={{padding:11,color:group.avg_confidence>=0.9?C.green:C.amber}}>{group.avg_confidence}</td>
+                <td style={{padding:11,maxWidth:260}}>
+                  <div>{group.standard_ref || '-'}</div>
+                  {group.standard_reason ? <div style={{color:C.muted,fontSize:11,marginTop:4}}>{group.standard_reason}</div> : null}
+                </td>
+                <td style={{padding:11}}>
+                  <select disabled={savingId===group.key} value={group.selected_group} onChange={(e)=>applyDraftToGroup(group,e.target.value)} style={{background:C.bg,border:`1px solid ${group.safe_to_bulk_confirm ? C.border : C.amber}`,color:C.text,borderRadius:8,padding:"8px 10px",minWidth:220}}>
+                    {groupOptions.map(g=><option key={g} value={g}>{g}</option>)}
+                  </select>
+                </td>
+                <td style={{padding:11}}>
+                  <button disabled={savingId===group.key || !group.safe_to_bulk_confirm} onClick={()=>saveGroup(group)} style={{background:group.safe_to_bulk_confirm?C.green:C.border,color:group.safe_to_bulk_confirm?'#06130F':C.muted,border:0,borderRadius:8,padding:'8px 12px',fontWeight:900,cursor:group.safe_to_bulk_confirm?'pointer':'not-allowed'}}>{group.safe_to_bulk_confirm ? (th?'Confirm Group':'Confirm Group') : (th?'Manual':'Manual')}</button>
+                </td>
+              </tr>)}</tbody>
+            </table>
+          </div>
+        ) : (
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:1450}}>
+              <thead><tr>{[th?"สถานะ":"Status",th?"บริษัท":"Company",th?"ปี":"Year",th?"งบ":"Statement",th?"ชื่อบัญชีจากไฟล์":"Raw account",'Line role','Risk',th?"Source":"Source",th?"Confidence":"Confidence",th?"AI/Suggested category":"AI/Suggested category",th?"Confirm":"Confirm"].map(h=><th key={h} style={{textAlign:"left",padding:11,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
               <tbody>{rows.map(row => {
                 const selectedGroup = draftGroups[row.id] || row.suggested_account_group || row.account_group || 'other';
+                const safety = analyzeMappingRowSafety(row, selectedGroup);
                 const isApproved = row.mapping_source === 'approved_mapping' && row.needs_review === false;
-                return <tr key={row.id} style={{borderBottom:`1px solid ${C.border}`,background:isApproved ? 'transparent' : C.amberLo}}>
+                return <tr key={row.id} style={{borderBottom:`1px solid ${C.border}`,background:isApproved ? 'transparent' : (safety.riskLevel === 'high' ? C.redLo : C.amberLo)}}>
                   <td style={{padding:11,color:isApproved ? C.green : C.amber,fontWeight:900}}>{isApproved ? '✓ OK' : '⚠ Review'}</td>
                   <td style={{padding:11}}>{row.companies?.ticker_symbol || row.company_id}</td>
                   <td style={{padding:11}}>{row.fiscal_year}</td>
                   <td style={{padding:11,color:C.muted}}>{row.statement_type}</td>
-                  <td style={{padding:11,fontWeight:700,maxWidth:320}}>
-                    <div>{row.raw_account_name}</div>
-                    {row.review_reason ? <div style={{color:C.muted,fontSize:11,marginTop:4}}>{row.review_reason}</div> : null}
-                  </td>
+                  <td style={{padding:11,fontWeight:700,maxWidth:320}}><div>{row.raw_account_name}</div>{safety.reason ? <div style={{color:C.muted,fontSize:11,marginTop:4}}>{safety.reason}</div> : null}</td>
+                  <td style={{padding:11}}><Badge color={roleColor(safety.lineRole)}>{safety.lineRole}</Badge></td>
+                  <td style={{padding:11}}><Badge color={riskColor(safety.riskLevel)}>{safety.safe ? 'safe' : safety.riskLevel}</Badge></td>
                   <td style={{padding:11}}><Badge color={sourceColor(row.mapping_source)}>{sourceLabel(row.mapping_source)}</Badge></td>
                   <td style={{padding:11,color:(Number(row.mapping_confidence)||0) >= 0.9 ? C.green : C.amber}}>{row.mapping_confidence ?? '-'}</td>
-                  <td style={{padding:11}}>
-                    <select disabled={savingId===row.id} value={selectedGroup} onChange={(e)=>setDraftGroups(prev=>({...prev,[row.id]:e.target.value}))} style={{background:C.bg,border:`1px solid ${isApproved ? C.border : C.amber}`,color:C.text,borderRadius:8,padding:"8px 10px",minWidth:220}}>
-                      {groupOptions.map(g=><option key={g} value={g}>{g}</option>)}
-                    </select>
-                  </td>
-                  <td style={{padding:11}}>
-                    <button disabled={savingId===row.id} onClick={()=>save(row)} style={{background:C.green,color:'#06130F',border:0,borderRadius:8,padding:'8px 12px',fontWeight:900,cursor:'pointer'}}>
-                      {savingId===row.id ? (th?'กำลังบันทึก...':'Saving...') : (th?'Confirm':'Approve')}
-                    </button>
-                  </td>
+                  <td style={{padding:11}}><select disabled={savingId===row.id} value={selectedGroup} onChange={(e)=>setDraftGroups(prev=>({...prev,[row.id]:e.target.value}))} style={{background:C.bg,border:`1px solid ${safety.safe ? C.border : C.amber}`,color:C.text,borderRadius:8,padding:"8px 10px",minWidth:220}}>{groupOptions.map(g=><option key={g} value={g}>{g}</option>)}</select></td>
+                  <td style={{padding:11}}><button disabled={savingId===row.id} onClick={()=>save(row)} style={{background:C.green,color:'#06130F',border:0,borderRadius:8,padding:'8px 12px',fontWeight:900,cursor:'pointer'}}>{savingId===row.id ? (th?'กำลังบันทึก...':'Saving...') : (th?'Confirm':'Approve')}</button></td>
                 </tr>;
               })}</tbody>
             </table>
@@ -2082,6 +2292,29 @@ function ExportCenterPage({ companies, store, importHistory, currentCompanyId, c
         exportYears = [Number(selectedBatch.fiscal_year)].filter(Boolean);
         mode = snapshot?.mode || (selectedBatch.status === 'confirmed' ? 'confirmed_snapshot' : 'archived_snapshot');
       }
+      const readinessRows = exportBatches;
+      const notDashboardReady = readinessRows.filter((row) => row.dashboard_ready === false || row.readiness_status === 'not_ready');
+      const notExportReady = readinessRows.filter((row) => row.export_ready === false || ['not_ready','mapping_review_required','dashboard_ready'].includes(row.readiness_status));
+      let exportReason = '';
+      if (notDashboardReady.length) {
+        exportReason = window.prompt(th
+          ? `ข้อมูล ${notDashboardReady.length} batch ยังไม่ผ่าน Dashboard Ready ต้องการ Export anyway เพื่อใช้ตรวจต่อหรือไม่? กรุณาระบุเหตุผล`
+          : `${notDashboardReady.length} batch(es) are not Dashboard Ready. Enter a reason to export anyway for review.`
+        ) || '';
+        if (!exportReason.trim()) {
+          setStatus({ loading:false, error:"", ok: th ? "ยกเลิก Export เพราะข้อมูลยังไม่ผ่าน Dashboard Ready" : "Export cancelled because the data is not Dashboard Ready." });
+          return;
+        }
+      } else if (notExportReady.length) {
+        exportReason = window.prompt(th
+          ? `ข้อมูล ${notExportReady.length} batch ยังไม่ผ่าน Export Ready แต่สามารถ Export เพื่อใช้ตรวจต่อได้ กรุณาระบุเหตุผล`
+          : `${notExportReady.length} batch(es) are not Export Ready. Enter a reason to export anyway for review.`
+        ) || '';
+        if (!exportReason.trim()) {
+          setStatus({ loading:false, error:"", ok: th ? "ยกเลิก Export เพื่อกลับไปตรวจ Mapping / Validation ก่อน" : "Export cancelled so Mapping / Validation can be reviewed first." });
+          return;
+        }
+      }
       const raw = await loadRowsForBatches(exportBatches);
       const mappingRows = isSupabaseConfigured ? await loadMappingReviewRows(selectedCompany.id, 1000).catch(() => []) : [];
       const filteredMappingRows = mappingRows.filter((row) => !exportYears.length || exportYears.includes(Number(row.fiscal_year)));
@@ -2101,6 +2334,8 @@ function ExportCenterPage({ companies, store, importHistory, currentCompanyId, c
         unit,
         mode,
         strictAnnual: true,
+        readinessRows,
+        exportReason,
       };
       const preview = previewFinancialExcelExport(exportOptions);
       const integrity = preview?.integrity || {};
@@ -2190,6 +2425,7 @@ function ExportCenterPage({ companies, store, importHistory, currentCompanyId, c
             <div><div style={labelStyle}>{th ? "ปี" : "Years"}</div><div style={{fontWeight:900}}>{sourceMode === "latest" ? yearsToExport.join(", ") || "-" : selectedBatch?.fiscal_year || "-"}</div></div>
             <div><div style={labelStyle}>{th ? "แถว / Review" : "Rows / Review"}</div><div style={{fontWeight:950,color:reviewCount?C.amber:C.green}}>{rowCount.toLocaleString()} / {reviewCount.toLocaleString()}</div></div>
             <div><div style={labelStyle}>{th ? "คุณภาพข้อมูล" : "Data quality"}</div><div style={{fontWeight:950,color:(()=>{const q=rowCount?Math.round((1-reviewCount/rowCount)*100):100;return q>=95?C.green:q>=80?C.amber:C.red;})()}}>{rowCount?Math.round((1-reviewCount/rowCount)*100):100}% {th?"พร้อมใช้":"clean"}</div></div>
+            <div><div style={labelStyle}>{th ? "Readiness Gate" : "Readiness Gate"}</div><div style={{display:'flex',gap:8,flexWrap:'wrap'}}>{(sourceMode==='latest'?latestBatchesForYears:[selectedBatch].filter(Boolean)).slice(0,4).map((row)=><Badge key={row.id} color={row.export_ready?C.green:row.dashboard_ready?C.blue:row.readiness_status==='mapping_review_required'?C.amber:C.red}>{row.fiscal_year}: {humanReadinessLabel(row.readiness_status, lang)}</Badge>)}</div></div>
             <div><div style={labelStyle}>{th ? "ไฟล์ที่จะใช้" : "Source files"}</div><div style={{color:C.muted,lineHeight:1.55}}>{sourceMode === "latest" ? (latestBatchesForYears.map((row)=>`${row.fiscal_year}: ${row.file_name}`).join("\n") || "-") : (selectedBatch?.file_name || "-")}</div></div>
           </div>
         </Card>
@@ -2532,7 +2768,7 @@ export default function App() {
     if (page==="slides") return <SlideViewer store={store} companyId={companyId} year={year} lang={lang} theme={theme} onImportSuccess={handleUpsert} onGoUpload={()=>setPage("upload")}/>;
     if (page==="access") return <AccessPage companyId={companyId} lang={lang}/>;
     if (page==="imports") return <ImportHistoryPage companyId={companyId} companies={companies} onRefresh={refreshRemoteData} onOpenDashboard={(row)=>{ setPage('momentum'); handleDashboardSnapshotChange({ batchId: row.id, companyId: row.company_id, fiscalYear: row.fiscal_year }); }} lang={lang}/>;
-    if (page==="quality") return <DataQualityPage store={store} companyId={companyId} lang={lang}/>;
+    if (page==="quality") return <DataQualityPage store={store} companyId={companyId} companies={companies} lang={lang}/>;
     if (page==="mapping") return <MappingCenterPage companyId={companyId} lang={lang} onRefresh={refreshRemoteData}/>;
     if (page==="alerts") return <AlertCenterPage companyId={companyId} companies={companies} lang={lang}/>;
     if (page==="audit") return <AuditPage lang={lang}/>;
