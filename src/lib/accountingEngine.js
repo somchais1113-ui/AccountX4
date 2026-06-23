@@ -1,4 +1,5 @@
 import { normalizeAccountingText, normalizeForAccountingMatch } from './accountingStandards.js';
+import { evaluateMappingConflict, isSafeForBulkConfirm, summarizeMappingConflicts } from './mappingConflictEngine.js';
 
 const asNumber = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 const hasWord = (text, words = []) => words.some((word) => text.includes(normalizeForAccountingMatch(word)));
@@ -131,14 +132,17 @@ export function detectAccountSubgroup(label = '', group = '') {
 }
 
 export function detectLineRole(row = {}) {
-  const label = `${row.raw_account_name || row.account_name || ''} ${row.section || ''} ${row.subsection || ''}`;
+  const rawLabel = `${row.raw_account_name || row.account_name || ''}`;
+  const contextLabel = `${rawLabel} ${row.section || ''} ${row.subsection || ''}`;
   const group = row.suggested_account_group || row.account_group || 'other';
-  if (hasDisclosureKeyword(label)) return LINE_ROLES.DISCLOSURE;
-  if (hasAttributionKeyword(label) && !['non_controlling_interests'].includes(group)) return LINE_ROLES.ATTRIBUTION;
-  if (hasOciKeyword(label) || group === 'other_comprehensive_income' || group === 'oci_tax') return LINE_ROLES.OCI;
-  if (hasMovementKeyword(label) && ['equity_statement', 'income_statement'].includes(row.statement_type)) return LINE_ROLES.MOVEMENT;
-  if (hasGrandTotalKeyword(label, group)) return LINE_ROLES.GRAND_TOTAL;
-  if (hasSubtotalKeyword(label) || SUMMARY_OR_TOTAL_GROUPS.has(group)) return LINE_ROLES.TOTAL;
+  if (hasDisclosureKeyword(contextLabel)) return LINE_ROLES.DISCLOSURE;
+  if (hasAttributionKeyword(contextLabel) && !['non_controlling_interests'].includes(group)) return LINE_ROLES.ATTRIBUTION;
+  if (hasOciKeyword(contextLabel) || group === 'other_comprehensive_income' || group === 'oci_tax') return LINE_ROLES.OCI;
+  if (hasMovementKeyword(contextLabel) && ['equity_statement', 'income_statement'].includes(row.statement_type)) return LINE_ROLES.MOVEMENT;
+  // Total/subtotal status must come from the account line itself or from known total groups.
+  // Section headings such as "รวมหนี้สิน" can surround a normal detail line like "เงินรับฝาก".
+  if (hasGrandTotalKeyword(rawLabel, group)) return LINE_ROLES.GRAND_TOTAL;
+  if (hasSubtotalKeyword(rawLabel) || SUMMARY_OR_TOTAL_GROUPS.has(group)) return LINE_ROLES.TOTAL;
   return LINE_ROLES.DETAIL;
 }
 
@@ -230,15 +234,23 @@ export function enrichRowSemantics(row = {}) {
   if (riskFlags.includes('consolidation_scope_risk')) reasonParts.push('Consolidation / NCI signal requires scope-aware review.');
   if (riskFlags.includes('critical_metric_review')) reasonParts.push('Core dashboard metric still needs human confirmation.');
   const combinedReason = [next.review_reason, ...reasonParts].filter(Boolean).join(' ');
+  const conflict = evaluateMappingConflict({ ...next, line_role: lineRole, metric_role: metricRole, risk_flags: riskFlags });
+  const conflictReview = conflict.conflict_status && conflict.conflict_status !== 'none';
+  const finalNeedsReview = Boolean(next.needs_review || conflictReview || conflict.approval_policy === 'manual_required' || conflict.approval_policy === 'blocked');
   return {
     ...next,
     line_role: lineRole,
     metric_role: metricRole,
     risk_flags: riskFlags,
-    mapping_status: mappingStatus,
-    review_reason: combinedReason || null,
-    is_dashboard_eligible: isDashboardEligible(next, lineRole, metricRole, riskFlags),
-    is_export_eligible: isExportEligible(next, lineRole, metricRole, riskFlags),
+    mapping_status: conflict.approval_policy === 'blocked' ? MAPPING_STATUSES.BLOCKED : mappingStatus,
+    review_reason: combinedReason || (conflict.conflict_reasons?.length ? `Mapping conflict: ${conflict.conflict_reasons.join(', ')}` : null),
+    needs_review: finalNeedsReview,
+    conflict_status: next.conflict_status || conflict.conflict_status,
+    conflict_reasons: next.conflict_reasons || conflict.conflict_reasons,
+    conflict_score: next.conflict_score ?? conflict.conflict_score,
+    approval_policy: next.approval_policy || conflict.approval_policy,
+    is_dashboard_eligible: isDashboardEligible(next, lineRole, metricRole, riskFlags) && !['blocked', 'confirmed_conflict'].includes(conflict.conflict_status),
+    is_export_eligible: isExportEligible(next, lineRole, metricRole, riskFlags) && !['blocked', 'confirmed_conflict'].includes(conflict.conflict_status),
   };
 }
 
@@ -251,11 +263,11 @@ export function analyzeMappingRowSafety(row = {}, selectedGroup = null) {
   const confidence = Number(adjusted.mapping_confidence || 0);
   const flags = normalizeRiskFlags(adjusted.risk_flags);
   const riskLevel = riskLevelFromFlags(flags);
+  const conflict = evaluateMappingConflict({ ...adjusted, risk_flags: flags });
   const safe = confidence >= 0.9
     && riskLevel === 'low'
-    && !['other', 'unknown'].includes(adjusted.account_group)
-    && ![LINE_ROLES.TOTAL, LINE_ROLES.SUBTOTAL, LINE_ROLES.GRAND_TOTAL, LINE_ROLES.OCI, LINE_ROLES.DISCLOSURE, LINE_ROLES.ATTRIBUTION, LINE_ROLES.MOVEMENT].includes(adjusted.line_role)
-    && !flags.length;
+    && isSafeForBulkConfirm({ ...adjusted, risk_flags: flags }, conflict);
+  const conflictReason = conflict.conflict_reasons?.length ? `Conflict: ${conflict.conflict_reasons.join(', ')}` : '';
   return {
     safe,
     riskLevel,
@@ -263,8 +275,20 @@ export function analyzeMappingRowSafety(row = {}, selectedGroup = null) {
     lineRole: adjusted.line_role,
     metricRole: adjusted.metric_role,
     mappingStatus: safe ? 'safe_suggestion' : adjusted.mapping_status,
-    reason: safe ? 'High-confidence detail line with no risk flags.' : (adjusted.review_reason || flags.join(', ') || 'Manual review recommended.'),
-    adjusted,
+    conflictStatus: conflict.conflict_status,
+    conflictReasons: conflict.conflict_reasons || [],
+    conflictScore: conflict.conflict_score || 0,
+    approvalPolicy: conflict.approval_policy,
+    requiresManualReason: conflict.requires_manual_reason,
+    reusable: conflict.reusable,
+    reason: safe ? 'High-confidence detail line with no conflict or risk flags.' : (adjusted.review_reason || conflictReason || flags.join(', ') || 'Manual review recommended.'),
+    adjusted: {
+      ...adjusted,
+      conflict_status: adjusted.conflict_status || conflict.conflict_status,
+      conflict_reasons: adjusted.conflict_reasons || conflict.conflict_reasons,
+      conflict_score: adjusted.conflict_score ?? conflict.conflict_score,
+      approval_policy: adjusted.approval_policy || conflict.approval_policy,
+    },
   };
 }
 
@@ -303,6 +327,12 @@ export function groupMappingRows(rows = [], draftGroups = {}) {
         metric_role: enriched.metric_role,
         risk_flags: [],
         risk_level: 'low',
+        conflict_reasons: [],
+        conflict_status: 'none',
+        approval_policy: 'safe_review',
+        conflict_count: 0,
+        manual_required_count: 0,
+        blocked_count: 0,
         rows: [],
         years: new Set(),
         confidence_values: [],
@@ -318,17 +348,26 @@ export function groupMappingRows(rows = [], draftGroups = {}) {
     group.confidence_values.push(Number(enriched.mapping_confidence || 0));
     if (enriched.source_file) group.source_files.add(enriched.source_file);
     group.risk_flags = uniq([...group.risk_flags, ...safety.flags]);
+    group.conflict_reasons = uniq([...group.conflict_reasons, ...(safety.conflictReasons || [])]);
+    if (safety.conflictStatus && safety.conflictStatus !== 'none') group.conflict_count += 1;
+    if (safety.approvalPolicy === 'manual_required') group.manual_required_count += 1;
+    if (safety.approvalPolicy === 'blocked' || safety.conflictStatus === 'blocked') group.blocked_count += 1;
+    if (safety.approvalPolicy === 'blocked') group.approval_policy = 'blocked';
+    else if (safety.approvalPolicy === 'manual_required' && group.approval_policy !== 'blocked') group.approval_policy = 'manual_required';
+    else if (safety.approvalPolicy === 'safe_auto' && group.approval_policy === 'safe_review') group.approval_policy = 'safe_auto';
     group.risk_level = ['high', 'medium'].includes(safety.riskLevel) && safety.riskLevel !== group.risk_level ? safety.riskLevel : group.risk_level;
-    if (safety.riskLevel === 'high') group.risk_level = 'high';
+    if (safety.riskLevel === 'high' || safety.approvalPolicy === 'blocked' || safety.approvalPolicy === 'manual_required') group.risk_level = 'high';
   });
   return [...groups.values()].map((group) => {
     const avgConfidence = group.confidence_values.length
       ? group.confidence_values.reduce((a, b) => a + b, 0) / group.confidence_values.length
       : 0;
     const safeRows = group.rows.filter((row) => analyzeMappingRowSafety(row, group.selected_group).safe).length;
-    const safe = safeRows === group.rows.length && group.rows.length > 0;
+    const safe = safeRows === group.rows.length && group.rows.length > 0 && group.conflict_count === 0 && group.blocked_count === 0;
+    const conflictStatus = group.blocked_count ? 'blocked' : group.manual_required_count ? 'manual_required' : group.conflict_count ? 'potential_conflict' : 'none';
     return {
       ...group,
+      conflict_status: conflictStatus,
       years: [...group.years].filter(Boolean).sort((a, b) => a - b),
       source_files: [...group.source_files],
       avg_confidence: Number(avgConfidence.toFixed(3)),
@@ -343,13 +382,21 @@ export function groupMappingRows(rows = [], draftGroups = {}) {
 }
 
 export function summarizeMappingGroups(groups = []) {
+  const rows = groups.flatMap((g) => g.rows || []);
+  const conflictSummary = summarizeMappingConflicts(rows);
   return {
     total_groups: groups.length,
     safe_groups: groups.filter((g) => g.safe_to_bulk_confirm).length,
     high_risk_groups: groups.filter((g) => g.risk_level === 'high').length,
     medium_risk_groups: groups.filter((g) => g.risk_level === 'medium').length,
+    conflict_groups: groups.filter((g) => g.conflict_count > 0 || g.conflict_status !== 'none').length,
+    manual_required_groups: groups.filter((g) => g.manual_required_count > 0 || g.approval_policy === 'manual_required').length,
+    blocked_groups: groups.filter((g) => g.blocked_count > 0 || g.approval_policy === 'blocked').length,
     rows: groups.reduce((acc, g) => acc + g.row_count, 0),
     safe_rows: groups.reduce((acc, g) => acc + g.safe_row_count, 0),
+    conflict_rows: conflictSummary.conflict_count,
+    manual_required_rows: conflictSummary.manual_required_count,
+    blocked_rows: conflictSummary.blocked_count,
   };
 }
 
@@ -485,14 +532,16 @@ export function deriveReadinessGate({ bucket = {}, validationResults = [], revie
   ]);
   const missingCoreMetrics = CORE_METRICS.filter((metric) => metrics[metric]?.amount === undefined && bucket.validation?.[metric]?.amount === undefined);
   const criticalReviewRows = rows.filter((row) => row.needs_review && CORE_DASHBOARD_GROUPS.has(row.account_group || row.suggested_account_group || 'other')).length;
-  const reviewRows = reviewCount ?? rows.filter((row) => row.needs_review || row.mapping_status === MAPPING_STATUSES.NEEDS_MANUAL_REVIEW || row.account_group === 'other').length;
+  const conflictSummary = summarizeMappingConflicts(rows);
+  const reviewRows = reviewCount ?? rows.filter((row) => row.needs_review || row.mapping_status === MAPPING_STATUSES.NEEDS_MANUAL_REVIEW || row.account_group === 'other' || row.conflict_status && row.conflict_status !== 'none').length;
   const blockingValidations = validationResults.filter((r) => r.severity === 'blocking');
   const errorValidations = validationResults.filter((r) => r.severity === 'error');
   const warningValidations = validationResults.filter((r) => r.severity === 'warning');
   const blockingFlags = bucketFlags.filter((flag) => EXPORT_BLOCKING_FLAGS.has(flag));
 
-  const dashboardReady = missingCoreMetrics.length === 0 && criticalReviewRows === 0 && blockingValidations.length === 0;
-  const exportReady = dashboardReady && errorValidations.length === 0 && blockingFlags.length === 0 && reviewRows === 0;
+  const blockingConflicts = conflictSummary.blocked_count + conflictSummary.manual_required_count;
+  const dashboardReady = missingCoreMetrics.length === 0 && criticalReviewRows === 0 && blockingValidations.length === 0 && conflictSummary.blocked_count === 0;
+  const exportReady = dashboardReady && errorValidations.length === 0 && blockingFlags.length === 0 && reviewRows === 0 && blockingConflicts === 0;
   const externalUseReady = exportReady && warningValidations.length === 0;
   let readinessStatus = READINESS_STATUSES.NOT_READY;
   if (externalUseReady) readinessStatus = READINESS_STATUSES.EXTERNAL_USE_READY;
@@ -503,6 +552,9 @@ export function deriveReadinessGate({ bucket = {}, validationResults = [], revie
   const penalty = validationResults.reduce((sum, result) => sum + validationIssueWeight(result), 0)
     + missingCoreMetrics.length * 12
     + Math.min(reviewRows, 20) * 2
+    + conflictSummary.conflict_count * 5
+    + conflictSummary.manual_required_count * 10
+    + conflictSummary.blocked_count * 20
     + blockingFlags.length * 8
     + criticalReviewRows * 10;
   const readinessScore = Math.max(0, Math.min(100, Math.round(100 - penalty)));
@@ -511,11 +563,14 @@ export function deriveReadinessGate({ bucket = {}, validationResults = [], revie
     ...blockingValidations.map((r) => r.message || r.validation_type),
     ...errorValidations.map((r) => r.message || r.validation_type),
     ...blockingFlags.map((flag) => `Blocking risk flag: ${flag}`),
+    ...(conflictSummary.blocked_count > 0 ? [`${conflictSummary.blocked_count} blocked mapping conflict(s).`] : []),
+    ...(conflictSummary.manual_required_count > 0 ? [`${conflictSummary.manual_required_count} manual mapping approval(s) required.`] : []),
   ];
   const warnings = [
     ...warningValidations.map((r) => r.message || r.validation_type),
     ...(reviewRows > 0 ? [`${reviewRows} mapping row(s) still need review.`] : []),
     ...(criticalReviewRows > 0 ? [`${criticalReviewRows} critical metric row(s) still need review.`] : []),
+    ...(conflictSummary.conflict_count > 0 ? [`${conflictSummary.conflict_count} mapping conflict / high-risk row(s) detected.`] : []),
   ];
 
   return {
@@ -531,6 +586,7 @@ export function deriveReadinessGate({ bucket = {}, validationResults = [], revie
     blocking_flags: blockingFlags,
     blocking_reasons: uniq(blockingReasons),
     warnings: uniq(warnings),
+    mapping_conflict_summary: conflictSummary,
     validation_counts: {
       pass: validationResults.filter((r) => r.severity === 'pass').length,
       info: validationResults.filter((r) => r.severity === 'info').length,
@@ -558,8 +614,21 @@ export function buildReadinessBundle(rows = [], options = {}) {
   return { ...validation, summaries };
 }
 
-export function flattenMetricSnapshotRows({ bucket = {}, summary = {}, importBatchId = null } = {}) {
-  const metrics = bucket.metrics || {};
+function mergeSnapshotMetricBuckets(bucket = {}) {
+  // v1.9.4: Dashboard/Export need one complete source of truth. Store both
+  // reported core metrics and supporting detail/validation metrics in the same
+  // snapshot table so the UI does not need to re-sum raw rows for COGS, SG&A,
+  // cash-flow or validation totals. Later sources intentionally override earlier
+  // ones: reported metrics > validation totals > detail sums.
+  return {
+    ...(bucket.detail || {}),
+    ...(bucket.validation || {}),
+    ...(bucket.metrics || {}),
+  };
+}
+
+export function flattenMetricSnapshotRows({ bucket = {}, summary = {}, importBatchId = null, snapshotRunId = null, current = true } = {}) {
+  const metrics = mergeSnapshotMetricBuckets(bucket);
   return Object.entries(metrics).map(([metricKey, metric]) => ({
     company_id: summary.company_id,
     import_batch_id: importBatchId,
@@ -574,6 +643,17 @@ export function flattenMetricSnapshotRows({ bucket = {}, summary = {}, importBat
     validation_status: summary.readiness_status || READINESS_STATUSES.NOT_READY,
     readiness_status: summary.readiness_status || READINESS_STATUSES.NOT_READY,
     readiness_score: summary.readiness_score ?? null,
+    snapshot_run_id: snapshotRunId,
+    snapshot_status: current ? 'current' : 'superseded',
+    is_current: Boolean(current),
+    source_metric_role: metric.source_type === 'validation_total' ? 'validation_line' : (metric.source_type === 'reported_total' ? 'dashboard_metric' : 'supporting_line'),
+    snapshot_metadata: {
+      engine: 'accounting_engine_v1_9_4',
+      generated_at: new Date().toISOString(),
+      source_rows_count: Array.isArray(metric.source_rows) ? metric.source_rows.length : 0,
+      batch_exact: Boolean(importBatchId),
+      mapping_conflict_summary: summary.mapping_conflict_summary || null,
+    },
   }));
 }
 

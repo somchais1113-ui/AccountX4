@@ -1,3 +1,27 @@
+## v1.9.6 — System Doctor + Migration Preflight + RPC Enforcement
+
+This release adds a production-safety layer before further feature work.
+
+### System Doctor
+- Adds **System Doctor / Database Preflight** page in the sidebar.
+- Adds `system_doctor_status()` RPC via migration `202606230010_system_doctor_preflight.sql`.
+- Checks critical v1.9.x database pieces: import transaction RPC, import job recovery, readiness columns, metric snapshot source-of-truth columns, mapping conflict columns, and RLS quick checks.
+- Shows blocking checks and the migration files that need to be run before importing.
+
+### RPC enforcement
+- Import save now requires `commit_import_batch` RPC.
+- The app no longer silently falls back to the old frontend multi-request import flow when the RPC is missing.
+- If the database is behind the app, import is blocked with a clear migration/System Doctor message.
+
+### Migration
+Run this after v1.9.5:
+
+```text
+202606230010_system_doctor_preflight.sql
+```
+
+Then open **System Doctor** and verify the status before importing new files.
+
 ## v1.7.8 — Export Accuracy, Parser Integrity & Scheduled Alerts
 
 This release hardens financial accuracy across export, parser, and alerting.
@@ -518,3 +542,162 @@ supabase/migrations/202606230005_readiness_gate.sql
 ```
 
 The migration is idempotent and does not delete financial rows.
+
+
+### v1.9.1.1 Hotfix note
+If Supabase SQL reports `mapping_decisions_normalized_financial_data_id_fkey` type mismatch, use this package. The v1.9.0 migration now uses `uuid` for `mapping_decisions.normalized_financial_data_id`, matching `normalized_financial_data.id`. Run `202606230004_accounting_engine_foundation.sql` again, then `202606230005_readiness_gate.sql`.
+
+## v1.9.1.4 Import Commit Protocol Hotfix
+
+This patch tightens the import save flow after v1.9.1.3:
+
+- New public and private imports are created as `pending` first, then promoted to `confirmed` only after rows are inserted successfully.
+- New rows are inserted as `pending`, promoted to `confirmed`, and only then are older rows/batches superseded.
+- Private monthly and trial-balance imports now follow the same last-good-data protection as normalized financial statement imports.
+- Fixes the undefined `excludeBatchId` regression in private data-table supersede logic.
+- Adds import safety regression tests to prevent partial imports, premature supersede, and failed-import leftovers from returning.
+
+No new SQL migration is required if v1.9.1 migrations `202606230004_accounting_engine_foundation.sql` and `202606230005_readiness_gate.sql` have already been installed.
+
+
+## v1.9.1.5 Mapping Memory Safety Hotfix
+
+This hotfix keeps the v1.9.1 readiness/import protocol, then hardens approved mapping reuse:
+
+- High-risk labels such as OCI tax, goodwill, non-controlling interests, hedge reserves, business-combination terms and reclassification items are never auto-reused as approved mappings.
+- Mapping approvals are applied by exact normalized_financial_data row id when available, instead of broad company + raw account + statement matching.
+- High-risk manual approvals are written to mapping_decisions as row-only approvals and are not stored as reusable account_mappings memory.
+- Mapping rebuild after approval only targets the affected batch when possible.
+- Regression tests cover import transaction safety and mapping-memory safety.
+
+No new SQL migration is required if v1.9.1 migrations 202606230004 and 202606230005 have already been applied.
+
+## v1.9.2 — Import Transaction RPC + Idempotency Lock
+
+This release moves the critical import commit path from multiple frontend Supabase requests into a single PostgreSQL RPC transaction.
+
+### What changed
+
+- Adds `public.commit_import_batch(...)` RPC.
+- Adds `public.import_jobs` as an active import lock / idempotency guard.
+- Public financial statements, private company normalized rows, monthly operating data, and trial balance rows can now be committed through one database transaction.
+- The frontend tries the RPC path first, then falls back to the older client-side path only if the RPC has not been installed yet.
+- Old confirmed rows are superseded inside the transaction before new rows are promoted to confirmed. Outside users see either the old good state or the new good state, not a half-finished state.
+- Duplicate save clicks are blocked by `import_jobs_active_key_idx` while the same company/year/period/scope/file is processing.
+- Monthly operating data now supports historical rows by removing the old full unique constraint and replacing it with one active confirmed row per company/year/month.
+
+### Required migration
+
+Run this after v1.9.1 migrations:
+
+```text
+supabase/migrations/202606230006_import_transaction_rpc.sql
+```
+
+Recommended order if upgrading from v1.8.0+:
+
+```text
+202606230002_export_security_hardening.sql
+202606230003_tfrs_standards_layer.sql
+202606230004_accounting_engine_foundation.sql
+202606230005_readiness_gate.sql
+202606230006_import_transaction_rpc.sql
+```
+
+The migration is idempotent and does not delete financial data. It may mark older duplicate monthly rows as `superseded` before creating the active-row unique index.
+
+## v1.9.3 — Import Job Monitor + Recovery Center
+
+Adds an operational control room for the v1.9.2 transaction import layer.
+
+New capabilities:
+
+- Import Jobs page (`งานนำเข้า / Import Jobs`)
+- View pending / processing / success / failed / cancelled import jobs
+- Detect stale jobs by age threshold
+- Clear stuck idempotency locks safely
+- Cancel active pending/processing jobs
+- Mark failed jobs as retry requested for audit trail
+- Bulk recover stale pending/processing jobs
+- Never deletes confirmed financial data during recovery
+- Rejects only still-pending attached batches and marks pending rows as `rolled_back`
+
+New migration:
+
+```text
+supabase/migrations/202606230007_import_job_recovery_center.sql
+```
+
+Run after v1.9.2 migration `202606230006_import_transaction_rpc.sql`.
+
+## v1.9.4 — Dashboard / Export Single Source of Truth
+
+This release makes `financial_metrics_snapshots` the primary source of financial metrics for Dashboard and Excel Export.
+
+### What changed
+
+- Dashboard data loading now tries current `financial_metrics_snapshots` first.
+- Excel Export uses the same snapshot-backed store as Dashboard, so exported metrics are aligned with the visible dashboard.
+- `normalized_financial_data` remains available for drill-down, raw rows, mapping review, and audit lineage; it is no longer the preferred metric source when current snapshots exist.
+- Accounting Engine snapshot rows now include reported metrics, supporting detail sums, and validation totals in one snapshot payload.
+- Snapshot rows carry `snapshot_run_id`, `is_current`, `snapshot_status`, `source_rows`, and metadata for lineage.
+- Rebuild marks old snapshot rows as `superseded` before inserting the new current snapshot, preserving audit history when the migration is installed.
+
+### Required migration
+
+Run this after v1.9.3 migration:
+
+```text
+supabase/migrations/202606230008_metric_snapshot_source_of_truth.sql
+```
+
+Recommended order from v1.8.0+:
+
+```text
+202606230002_export_security_hardening.sql
+202606230003_tfrs_standards_layer.sql
+202606230004_accounting_engine_foundation.sql
+202606230005_readiness_gate.sql
+202606230006_import_transaction_rpc.sql
+202606230007_import_job_recovery_center.sql
+202606230008_metric_snapshot_source_of_truth.sql
+```
+
+After deploying and running SQL 008, go to `Data Quality / Readiness Gate` and run `Rebuild / Revalidate Company` so current metric snapshots are regenerated with v1.9.4 lineage metadata.
+
+## v1.9.5 — Mapping Conflict Detector + Approval Control
+
+This release adds an accounting mapping control layer before mappings can feed the metric snapshot source of truth.
+
+### What changed
+
+- Added `mappingConflictEngine` to detect high-risk accounting terms, previous approved mapping conflicts, and unsafe reuse of mapping memory.
+- Mapping Center now shows conflict / manual-required / blocked badges and a Mapping Conflict Center view.
+- Confirm Safe Suggestions now only approves `safe_auto` rows with no conflict and no high-risk accounting context.
+- Manual approval for risky/conflicting rows requires an approval reason and is stored as row-only or non-reusable when appropriate.
+- Data Quality now includes mapping conflict counts so readiness is reduced when unresolved conflicts remain.
+- Excel Export adds mapping conflict summary fields to Cover, Data Quality, and Readiness Gate sheets.
+- Parser and export logic protect clear core total metrics while still blocking unsafe subtotal / OCI / NCI / goodwill / fair-value mappings from bulk confirmation.
+
+### Required migration
+
+Run this after v1.9.4 migration:
+
+```text
+supabase/migrations/202606230009_mapping_conflict_control.sql
+```
+
+Recommended order from v1.8.0+:
+
+```text
+202606230002_export_security_hardening.sql
+202606230003_tfrs_standards_layer.sql
+202606230004_accounting_engine_foundation.sql
+202606230005_readiness_gate.sql
+202606230006_import_transaction_rpc.sql
+202606230007_import_job_recovery_center.sql
+202606230008_metric_snapshot_source_of_truth.sql
+202606230009_mapping_conflict_control.sql
+```
+
+After deploying and running SQL 009, open Mapping Center and review any `Conflict`, `Manual Required`, or `Blocked` rows before rebuilding readiness and exporting.

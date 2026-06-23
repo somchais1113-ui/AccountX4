@@ -1,6 +1,7 @@
 import * as XLSX from 'xlsx';
 import { buildTfrsMappingReferenceRows, evaluateTfrsDataQuality, inferAccountingStandardProfile } from './accountingStandards.js';
 import { enrichRowSemantics, LINE_ROLES, runValidationEngine } from './accountingEngine.js';
+import { summarizeMappingConflicts } from './mappingConflictEngine.js';
 
 const n = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 const pick = (groups = {}, keys = []) => {
@@ -369,6 +370,8 @@ function normalizeMappingRows(mappingRows = []) {
     needs_review: row.needs_review, review_reason: row.review_reason, source_file: row.source_file,
     source_sheet: row.source_sheet, source_row: row.source_row,
     standard_profile: row.accounting_standard_profile, standard_ref: row.standard_ref, standard_source: row.standard_source, standard_reason: row.standard_reason,
+    conflict_status: row.conflict_status || 'none', conflict_reasons: Array.isArray(row.conflict_reasons) ? row.conflict_reasons.join(', ') : row.conflict_reasons,
+    approval_policy: row.approval_policy || '', manual_approval_reason: row.manual_approval_reason || '', conflict_score: row.conflict_score ?? '',
   }));
 }
 
@@ -394,8 +397,9 @@ export function buildFinancialExcelWorkbook({
   const sourceStore = normalizedRows?.length ? buildStoreFromNormalizedRows(normalizedRows, importBatches) : store;
   const selectionsByYear = Object.fromEntries(actualYears.map((year) => [year, getAnnualSelection(sourceStore, companyId || company.id, year, { strictAnnual })]));
   const metricsByYear = Object.fromEntries(actualYears.map((year) => [year, getMetrics(selectionsByYear[year]?.groups || {}, { missingAnnual: Boolean(selectionsByYear[year]?.missingAnnual), periodKey: selectionsByYear[year]?.periodKey || null })]));
-  const reviewRows = mappingRows.filter((row) => row?.needs_review !== false || row?.account_group === 'other' || Number(row?.mapping_confidence) < 0.86);
-  const hasImportantReview = reviewRows.length > 0;
+  const reviewRows = mappingRows.filter((row) => row?.needs_review !== false || row?.account_group === 'other' || Number(row?.mapping_confidence) < 0.86 || (row?.conflict_status && row.conflict_status !== 'none') || ['manual_required','blocked','row_only_manual'].includes(row?.approval_policy));
+  const mappingConflictSummary = summarizeMappingConflicts(mappingRows);
+  const hasImportantReview = reviewRows.length > 0 || mappingConflictSummary.conflict_count > 0;
   const profile = company.accountingStandardProfile || company.accounting_standard_profile || inferAccountingStandardProfile(company, {});
   const dataQuality = evaluateTfrsDataQuality(rawRows?.length ? rawRows : normalizedRows, { profile });
   const accountingValidation = runValidationEngine(rawRows?.length ? rawRows : normalizedRows, { strictAnnual });
@@ -417,6 +421,9 @@ export function buildFinancialExcelWorkbook({
     ['Accounting standard profile', profile],
     ['Data Quality Score', `${dataQuality.score}/100`],
     ['Readiness Gate', readinessRows?.length ? readinessRows.map((row) => `${row.fiscal_year || ''}: ${row.readiness_status || 'not_validated'} (${row.readiness_score ?? '-'})`).join(' | ') : 'not_validated'],
+    ['Mapping conflicts', mappingConflictSummary.conflict_count],
+    ['Manual mapping approvals required', mappingConflictSummary.manual_required_count],
+    ['Blocked mapping conflicts', mappingConflictSummary.blocked_count],
     ...(exportReason ? [['Export anyway reason', exportReason]] : []),
     [t.dataStatus, hasImportantReview ? t.reviewWarning : t.clean],
     ...(hasIntegrityIssue ? [[t.warning, t.integrityWarn]] : []),
@@ -483,6 +490,10 @@ export function buildFinancialExcelWorkbook({
     total_rows: row.total_rows,
     last_validated_at: row.last_validated_at,
     export_reason: exportReason || '',
+    mapping_conflict_count: mappingConflictSummary.conflict_count,
+    manual_required_count: mappingConflictSummary.manual_required_count,
+    blocked_conflict_count: mappingConflictSummary.blocked_count,
+    exported_with_mapping_conflicts: mappingConflictSummary.conflict_count > 0,
   })), t.readiness || 'Readiness Gate');
 
   appendJsonSheet(wb, [{
@@ -495,6 +506,11 @@ export function buildFinancialExcelWorkbook({
     critical_review_rows: dataQuality.critical_review_rows,
     validation_passed: accountingValidation.passed,
     validation_issues: accountingValidation.results.filter(r => !['pass','info'].includes(r.severity)).length,
+    mapping_conflict_count: mappingConflictSummary.conflict_count,
+    manual_required_count: mappingConflictSummary.manual_required_count,
+    blocked_count: mappingConflictSummary.blocked_count,
+    row_only_approval_count: mappingConflictSummary.row_only_approval_count,
+    missing_approval_reason_count: mappingConflictSummary.missing_approval_reason_count,
     consolidation_signals: dataQuality.consolidation_signals.join(', '),
     business_combination_signals: dataQuality.business_combination_signals.join(', '),
   }], t.quality);

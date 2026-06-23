@@ -215,6 +215,17 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
 
   const handleConfirm = async () => {
     if (saving) return;
+    const mismatchWarning = getCompanyMismatchWarning(parseSummary, company, th);
+    if (mismatchWarning) {
+      setStatus({
+        type: 'error',
+        msg: th
+          ? 'ยังไม่บันทึก: บริษัทในไฟล์ไม่ตรงกับบริษัทที่เลือก กรุณาเปลี่ยนบริษัทด้านซ้ายให้ตรงกับไฟล์ก่อน เพื่อป้องกันข้อมูลปนกัน'
+          : 'Save blocked: the file company does not match the selected company. Switch to the matching company before saving to avoid data contamination.'
+      });
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      return;
+    }
     const savePayload = sourceType.startsWith('private_') ? privatePayload : parsedData;
     const rowsCount = sourceType.startsWith('private_') ? (privatePayload?.summary?.rows || 0) : parsedData.length;
     setSaving(true);
@@ -354,8 +365,9 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
         </div>
         <button
           onClick={handleConfirm}
-          disabled={saving || !parsedData.length}
-          style={{ background: saving ? C.muted : C.accent, color: '#fff', border: 'none', padding: '10px 20px', borderRadius: 8, fontWeight: 700, cursor: saving ? 'wait' : 'pointer', opacity: saving ? 0.75 : 1 }}
+          disabled={saving || !parsedData.length || Boolean(companyMismatchWarning)}
+          title={companyMismatchWarning ? (th ? 'ต้องเปลี่ยนบริษัทให้ตรงกับไฟล์ก่อนบันทึก' : 'Switch to the matching company before saving') : undefined}
+          style={{ background: (saving || companyMismatchWarning) ? C.muted : C.accent, color: '#fff', border: 'none', padding: '10px 20px', borderRadius: 8, fontWeight: 700, cursor: saving ? 'wait' : companyMismatchWarning ? 'not-allowed' : 'pointer', opacity: (saving || companyMismatchWarning) ? 0.75 : 1 }}
         >
           {saving ? (th ? "กำลังบันทึก..." : "Saving...") : (th ? "ยืนยันและบันทึก" : "Confirm & Save")}
         </button>
@@ -368,8 +380,11 @@ export default function ImportWizard({ companyId, company, onImportSuccess, lang
       )}
 
       {companyMismatchWarning && (
-        <div style={{ marginBottom: 16, padding: 14, borderRadius: 10, border: `1px solid ${C.amber}`, background: C.amberLo, color: C.text, fontWeight: 800, lineHeight: 1.6 }}>
+        <div style={{ marginBottom: 16, padding: 14, borderRadius: 10, border: `1px solid ${C.red || C.amber}`, background: C.redLo || C.amberLo, color: C.text, fontWeight: 800, lineHeight: 1.6 }}>
           ⚠ {companyMismatchWarning}
+          <div style={{ marginTop: 6, color: C.red || C.amber }}>
+            {th ? 'ระบบบล็อกการบันทึกไฟล์นี้ไว้ก่อน กรุณาเลือกบริษัทให้ตรงกับไฟล์ แล้วอัปโหลดใหม่อีกครั้ง' : 'Saving is blocked. Select the matching company and upload the file again.'}
+          </div>
         </div>
       )}
 

@@ -11,13 +11,14 @@ import {
   isSupabaseConfigured, supabase, signIn, signUp, resetPassword, signOut,
   loadCompanies, createCompany, updateCompany, loadAllFinancialData, loadFinancialDataSnapshot, saveImportBatch, savePrivateImportBatch, loadExchangeRates, saveExchangeRate,
   loadAuditLog, loadCompanyMembers, grantCompanyAccess, revokeCompanyAccess,
-  loadImportHistory, loadImportBatchRows, rollbackImportBatch, getRawFileSignedUrl,
+  loadImportHistory, loadImportBatchRows, rollbackImportBatch, getRawFileSignedUrl, loadImportJobs, recoverImportJob, recoverStuckImportJobs, loadSystemDoctorStatus, APP_SCHEMA_VERSION, REQUIRED_MIGRATIONS,
   loadMappingReviewRows, updateMappingForRawAccount, bulkApproveMappingRows, rebuildAccountingReadiness, loadAccountingReadiness, loadValidationResults, loadFinancialMetricSnapshots,
   loadAlertEvents, updateAlertEventStatus, loadLineAlertSettings, saveLineAlertSettings, createAlertEvent,
 } from "./lib/supabase.js";
 import ImportWizard from "./components/ImportWizard";
 import MomentumDashboard from "./components/Dashboard";
 import { groupMappingRows, summarizeMappingGroups, analyzeMappingRowSafety, detectAccountSubgroup, humanReadinessLabel } from "./lib/accountingEngine.js";
+import { summarizeMappingConflicts } from "./lib/mappingConflictEngine.js";
 
 // ═══════════════════════════════════════════════════════════
 // THEME SYSTEM — Dark / Light (realtime)
@@ -1680,12 +1681,277 @@ function ImportHistoryPage({ companyId, companies, onRefresh, onOpenDashboard, l
   );
 }
 
+
+function ImportJobsPage({ companyId, companies = [], onRefresh, onOpenImportHistory, lang }) {
+  const C = useC();
+  const th = lang === "th";
+  const [jobs, setJobs] = useState([]);
+  const [filter, setFilter] = useState('all');
+  const [olderThan, setOlderThan] = useState(30);
+  const [status, setStatus] = useState({ loading: true, error: '', ok: '' });
+  const [busy, setBusy] = useState(null);
+  const company = companies.find(c => Number(c.id) === Number(companyId));
+
+  const load = async () => {
+    if (!isSupabaseConfigured) { setStatus({ loading:false, error: th ? 'ต้องเชื่อม Supabase ก่อน' : 'Supabase is required', ok:'' }); return; }
+    setStatus({ loading:true, error:'', ok:'' });
+    try {
+      const data = await loadImportJobs({ companyId: companyId || null, status: filter, limit: 300, staleMinutes: olderThan });
+      setJobs(data);
+      setStatus({ loading:false, error:'', ok:'' });
+    } catch (error) {
+      setStatus({ loading:false, error:error.message || String(error), ok:'' });
+    }
+  };
+  useEffect(() => { load(); }, [companyId, filter, olderThan, lang]);
+
+  const runRecovery = async (job, action) => {
+    const actionText = action === 'cancel' ? (th ? 'ยกเลิกงานนำเข้า' : 'cancel this import job') : (th ? 'เคลียร์งานค้าง/ตั้งเป็น failed' : 'clear this stuck job');
+    const note = window.prompt(th ? `ใส่เหตุผลเพื่อ ${actionText}` : `Enter a reason to ${actionText}`, th ? 'Recovery from Import Job Monitor' : 'Recovered from Import Job Monitor');
+    if (note === null) return;
+    setBusy(job.id);
+    try {
+      await recoverImportJob({ jobId: job.id, action, note });
+      await load();
+      await onRefresh?.();
+      setStatus({ loading:false, error:'', ok: th ? 'Recovery สำเร็จ' : 'Recovery action completed.' });
+    } catch (error) {
+      setStatus({ loading:false, error:error.message || String(error), ok:'' });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const recoverStuck = async () => {
+    const note = window.prompt(th ? `เคลียร์ jobs ที่ pending/processing เกิน ${olderThan} นาที` : `Recover jobs pending/processing for more than ${olderThan} minutes`, th ? 'Bulk recovery from Import Job Monitor' : 'Bulk recovery from Import Job Monitor');
+    if (note === null) return;
+    setBusy('bulk');
+    try {
+      const result = await recoverStuckImportJobs({ companyId: companyId || null, olderThanMinutes: olderThan, note });
+      await load();
+      await onRefresh?.();
+      setStatus({ loading:false, error:'', ok: th ? `Recovery สำเร็จ ${result?.recovered_count || 0} job` : `Recovered ${result?.recovered_count || 0} job(s).` });
+    } catch (error) {
+      setStatus({ loading:false, error:error.message || String(error), ok:'' });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const colorForJob = (job) => {
+    if (job.stale) return C.red;
+    if (job.status === 'success') return C.green;
+    if (job.status === 'failed') return C.red;
+    if (job.status === 'cancelled') return C.muted;
+    if (['pending','processing'].includes(job.status)) return C.amber;
+    return C.muted;
+  };
+  const jobStatusLabel = (job) => job.stale ? (th ? 'ค้าง / Stuck' : 'Stuck') : (job.status || 'unknown');
+  const activeJobs = jobs.filter(j => ['pending','processing'].includes(j.status)).length;
+  const staleJobs = jobs.filter(j => j.stale).length;
+  const failedJobs = jobs.filter(j => j.status === 'failed').length;
+  const successJobs = jobs.filter(j => j.status === 'success').length;
+  const pendingBatchJobs = jobs.filter(j => j.import_batches?.status === 'pending').length;
+
+  return (
+    <div>
+      <PageHeader title={th ? 'งานนำเข้า / Import Job Monitor' : 'Import Job Monitor'} subtitle={th ? 'ห้องควบคุมงานบันทึกไฟล์ ดู jobs ที่ค้าง ล้มเหลว หรือสำเร็จ และกู้คืน lock ได้อย่างปลอดภัย' : 'Monitor transaction jobs, stuck locks, failed imports, and safe recovery actions.'}/>
+      <div className="responsive-grid-3" style={{display:'grid',gridTemplateColumns:'repeat(5,1fr)',gap:12,marginBottom:16}}>
+        <Card style={{padding:16}}><div style={{fontSize:12,color:C.muted,fontWeight:800}}>Active</div><div style={{fontSize:26,fontWeight:950,color:activeJobs?C.amber:C.muted}}>{activeJobs}</div></Card>
+        <Card style={{padding:16}}><div style={{fontSize:12,color:C.muted,fontWeight:800}}>Stuck</div><div style={{fontSize:26,fontWeight:950,color:staleJobs?C.red:C.green}}>{staleJobs}</div></Card>
+        <Card style={{padding:16}}><div style={{fontSize:12,color:C.muted,fontWeight:800}}>Failed</div><div style={{fontSize:26,fontWeight:950,color:failedJobs?C.red:C.muted}}>{failedJobs}</div></Card>
+        <Card style={{padding:16}}><div style={{fontSize:12,color:C.muted,fontWeight:800}}>Success</div><div style={{fontSize:26,fontWeight:950,color:C.green}}>{successJobs}</div></Card>
+        <Card style={{padding:16}}><div style={{fontSize:12,color:C.muted,fontWeight:800}}>Pending Batch</div><div style={{fontSize:26,fontWeight:950,color:pendingBatchJobs?C.amber:C.muted}}>{pendingBatchJobs}</div></Card>
+      </div>
+
+      <Card style={{marginBottom:16,border:`1px solid ${staleJobs?C.red:C.border}`}}>
+        <div style={{display:'flex',justifyContent:'space-between',gap:16,alignItems:'center',flexWrap:'wrap'}}>
+          <div>
+            <div style={{fontSize:18,fontWeight:950,color:C.white}}>{th ? 'Recovery Center' : 'Recovery Center'}</div>
+            <div style={{fontSize:13,color:C.muted,lineHeight:1.7,marginTop:4}}>
+              {th ? 'ถ้างานค้างจากการกด Save ซ้ำ เน็ตหลุด หรือ lock ไม่ถูกปล่อย ให้เคลียร์เฉพาะ job ที่ค้าง โดยไม่แตะข้อมูล confirmed เดิม' : 'Clear stale import locks without touching existing confirmed data. Pending attached batches are rejected and pending rows are rolled back.'}
+            </div>
+          </div>
+          <div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'center'}}>
+            <select value={filter} onChange={e=>setFilter(e.target.value)} style={{background:C.bg,border:`1px solid ${C.border}`,color:C.text,borderRadius:9,padding:'9px 10px',fontWeight:800}}>
+              {['all','pending','processing','success','failed','cancelled'].map(v=><option key={v} value={v}>{v}</option>)}
+            </select>
+            <select value={olderThan} onChange={e=>setOlderThan(Number(e.target.value))} style={{background:C.bg,border:`1px solid ${C.border}`,color:C.text,borderRadius:9,padding:'9px 10px',fontWeight:800}}>
+              {[10,30,60,120].map(v=><option key={v} value={v}>{th?`เกิน ${v} นาที`:`>${v} min`}</option>)}
+            </select>
+            <button onClick={load} disabled={status.loading} style={{border:0,borderRadius:9,padding:'9px 12px',fontWeight:900,cursor:status.loading?'wait':'pointer',background:C.blueLo,color:C.blue}}>{th?'Refresh':'Refresh'}</button>
+            <button onClick={recoverStuck} disabled={busy==='bulk' || !staleJobs} style={{border:0,borderRadius:9,padding:'9px 12px',fontWeight:900,cursor:busy==='bulk'?'wait':staleJobs?'pointer':'not-allowed',background:staleJobs?C.redLo:C.bg,color:staleJobs?C.red:C.muted}}>{busy==='bulk'?(th?'กำลังกู้คืน...':'Recovering...'):(th?'Recover Stuck':'Recover Stuck')}</button>
+            <button onClick={()=>onOpenImportHistory?.()} style={{border:0,borderRadius:9,padding:'9px 12px',fontWeight:900,cursor:'pointer',background:C.accentLo,color:C.accent}}>{th?'ไป Import History':'Import History'}</button>
+          </div>
+        </div>
+      </Card>
+
+      {status.error ? <div style={{marginBottom:12,color:C.red,fontWeight:800}}>{status.error}</div> : null}
+      {status.ok ? <div style={{marginBottom:12,color:C.green,fontWeight:800}}>{status.ok}</div> : null}
+
+      <Card style={{padding:0,overflow:'hidden'}}>
+        {status.loading ? <div style={{padding:20}}>{th?'กำลังโหลด jobs...':'Loading jobs...'}</div> : (
+          <div style={{overflowX:'auto'}}>
+            <table style={{width:'100%',borderCollapse:'collapse',fontSize:13,minWidth:1280}}>
+              <thead><tr>{[th?'เริ่ม':'Started',th?'บริษัท':'Company',th?'ไฟล์':'File',th?'ปี/งวด':'Year/Period',th?'Source':'Source',th?'Job Status':'Job Status',th?'Batch':'Batch',th?'อายุ':'Age',th?'Error / Note':'Error / Note',th?'จัดการ':'Action'].map(h=><th key={h} style={{textAlign:'left',padding:11,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
+              <tbody>{jobs.map(job => (
+                <tr key={job.id} style={{borderBottom:`1px solid ${C.border}`}}>
+                  <td style={{padding:11,color:C.muted,whiteSpace:'nowrap'}}>{job.started_at ? new Date(job.started_at).toLocaleString(th?'th-TH':'en-GB') : '-'}</td>
+                  <td style={{padding:11,fontWeight:900}}>{job.companies?.ticker_symbol || job.companies?.name_th || company?.tickerSymbol || job.company_id}</td>
+                  <td style={{padding:11,maxWidth:240,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}} title={job.file_name || job.job_key}>{job.file_name || '-'}</td>
+                  <td style={{padding:11}}>{job.fiscal_year || '-'} · {job.period || 'FY'}<div style={{fontSize:11,color:C.muted}}>{job.statement_scope || '-'}</div></td>
+                  <td style={{padding:11,color:C.muted}}>{job.source_type || '-'}</td>
+                  <td style={{padding:11}}><Badge color={colorForJob(job)}>{jobStatusLabel(job)}</Badge>{job.recovery_action ? <div style={{fontSize:11,color:C.muted,marginTop:4}}>recovery: {job.recovery_action}</div> : null}</td>
+                  <td style={{padding:11}}>{job.import_batch_id ? <><Badge color={job.import_batches?.status==='confirmed'?C.green:job.import_batches?.status==='pending'?C.amber:job.import_batches?.status==='rejected'?C.red:C.muted}>{job.import_batches?.status || 'linked'}</Badge><div style={{fontSize:11,color:C.muted,marginTop:4}}>rows {job.import_batches?.total_rows ?? '-'}</div></> : <span style={{color:C.muted}}>-</span>}</td>
+                  <td style={{padding:11,color:job.stale?C.red:C.muted,fontWeight:job.stale?900:600}}>{job.age_minutes ?? '-'} min</td>
+                  <td style={{padding:11,maxWidth:300,color:job.error_message?C.red:C.muted}}>
+                    <div style={{whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}} title={job.error_message || job.recovery_note || ''}>{job.error_message || job.recovery_note || '-'}</div>
+                    <div style={{fontSize:10,color:C.muted,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}} title={job.job_key}>key: {job.job_key}</div>
+                  </td>
+                  <td style={{padding:11,display:'flex',gap:8,flexWrap:'wrap'}}>
+                    {['pending','processing'].includes(job.status) ? <button disabled={busy===job.id} onClick={()=>runRecovery(job, 'clear_stuck')} style={{border:0,borderRadius:8,padding:'7px 10px',fontWeight:800,cursor:busy===job.id?'wait':'pointer',background:C.redLo,color:C.red}}>{th?'Clear Lock':'Clear Lock'}</button> : null}
+                    {['pending','processing'].includes(job.status) ? <button disabled={busy===job.id} onClick={()=>runRecovery(job, 'cancel')} style={{border:0,borderRadius:8,padding:'7px 10px',fontWeight:800,cursor:busy===job.id?'wait':'pointer',background:C.amberLo,color:C.amber}}>{th?'Cancel':'Cancel'}</button> : null}
+                    {job.status === 'failed' ? <button disabled={busy===job.id} onClick={()=>runRecovery(job, 'retry_requested')} style={{border:0,borderRadius:8,padding:'7px 10px',fontWeight:800,cursor:busy===job.id?'wait':'pointer',background:C.blueLo,color:C.blue}}>{th?'Mark Retry':'Mark Retry'}</button> : null}
+                    {!['pending','processing','failed'].includes(job.status) ? <span style={{color:C.muted,fontSize:12}}>{th?'ไม่มี action':'No action'}</span> : null}
+                  </td>
+                </tr>
+              ))}</tbody>
+            </table>
+            {!jobs.length ? <div style={{padding:20,color:C.muted}}>{th?'ยังไม่มี import jobs หรือยังไม่ได้รัน SQL 006/007':'No import jobs found, or migrations 006/007 have not been run yet.'}</div> : null}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+
+function SystemDoctorPage({ lang }) {
+  const C = useC();
+  const th = lang === "th";
+  const [doctor, setDoctor] = useState(null);
+  const [status, setStatus] = useState({ loading: true, error: '' });
+
+  const load = async () => {
+    if (!isSupabaseConfigured) {
+      setDoctor(null);
+      setStatus({ loading: false, error: th ? 'ต้องเชื่อม Supabase ก่อนใช้ System Doctor' : 'Supabase is required for System Doctor.' });
+      return;
+    }
+    setStatus({ loading: true, error: '' });
+    try {
+      const result = await loadSystemDoctorStatus();
+      setDoctor(result);
+      setStatus({ loading: false, error: '' });
+    } catch (error) {
+      setStatus({ loading: false, error: error.message || String(error) });
+    }
+  };
+
+  useEffect(() => { load(); }, [lang]);
+
+  const colorFor = (checkOrStatus) => {
+    const statusValue = typeof checkOrStatus === 'string' ? checkOrStatus : checkOrStatus?.status;
+    if (statusValue === 'pass') return C.green;
+    if (statusValue === 'warn' || statusValue === 'warning') return C.amber;
+    return C.red;
+  };
+  const doctorColor = colorFor(doctor?.overall_status === 'pass' ? 'pass' : doctor?.overall_status === 'warning' ? 'warn' : 'blocking');
+  const blockingChecks = doctor?.checks?.filter(c => c.status === 'blocking') || [];
+  const warnChecks = doctor?.checks?.filter(c => c.status === 'warn') || [];
+  const passChecks = doctor?.checks?.filter(c => c.status === 'pass') || [];
+  const migrationList = doctor?.missing_migrations?.length ? doctor.missing_migrations : REQUIRED_MIGRATIONS;
+
+  return (
+    <div>
+      <PageHeader
+        title={th ? 'System Doctor / ตรวจฐานข้อมูล' : 'System Doctor / Database Preflight'}
+        subtitle={th ? 'ตรวจว่า Supabase schema, RPC, migration และ import lock พร้อมกับ app version นี้หรือยัง' : 'Checks Supabase schema, RPCs, migrations, and import locks required by this app version.'}
+      />
+
+      <div className="responsive-grid-3" style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginBottom:16}}>
+        <Card style={{padding:16,border:`1px solid ${doctorColor}`}}>
+          <div style={{fontSize:12,color:C.muted,fontWeight:800}}>App Schema</div>
+          <div style={{fontSize:24,fontWeight:950,color:C.white}}>{APP_SCHEMA_VERSION}</div>
+        </Card>
+        <Card style={{padding:16}}>
+          <div style={{fontSize:12,color:C.muted,fontWeight:800}}>Database</div>
+          <div style={{fontSize:24,fontWeight:950,color:doctorColor}}>{doctor?.overall_status ? doctor.overall_status.toUpperCase() : '-'}</div>
+        </Card>
+        <Card style={{padding:16}}>
+          <div style={{fontSize:12,color:C.muted,fontWeight:800}}>Blocking</div>
+          <div style={{fontSize:24,fontWeight:950,color:blockingChecks.length?C.red:C.green}}>{blockingChecks.length}</div>
+        </Card>
+        <Card style={{padding:16}}>
+          <div style={{fontSize:12,color:C.muted,fontWeight:800}}>Safe to Import</div>
+          <div style={{fontSize:24,fontWeight:950,color:doctor?.safe_to_import?C.green:C.red}}>{doctor?.safe_to_import ? 'YES' : 'NO'}</div>
+        </Card>
+      </div>
+
+      <Card style={{marginBottom:16,border:`1px solid ${doctor?.safe_to_import?C.green:C.red}`}}>
+        <div style={{display:'flex',justifyContent:'space-between',gap:16,alignItems:'flex-start',flexWrap:'wrap'}}>
+          <div>
+            <div style={{fontSize:18,fontWeight:950,color:C.white}}>{th ? 'Preflight Summary' : 'Preflight Summary'}</div>
+            <div style={{fontSize:13,color:C.muted,lineHeight:1.75,marginTop:6}}>
+              {doctor?.safe_to_import
+                ? (th ? 'ฐานข้อมูลพร้อมสำหรับ import แบบ transaction RPC แล้ว' : 'Database is ready for transaction-safe imports.')
+                : (th ? 'ยังไม่ควร import: schema/RPC บางส่วนยังไม่พร้อม ให้รัน migration ที่แจ้งก่อน' : 'Do not import yet: schema/RPC pieces are missing. Apply the listed migration(s) first.')}
+            </div>
+            {doctor?.checked_at ? <div style={{fontSize:12,color:C.muted,marginTop:8}}>{th?'ตรวจล่าสุด':'Checked'}: {new Date(doctor.checked_at).toLocaleString(th?'th-TH':'en-GB')}</div> : null}
+          </div>
+          <button onClick={load} disabled={status.loading} style={{border:0,borderRadius:10,padding:'10px 14px',fontWeight:900,cursor:status.loading?'wait':'pointer',background:C.blueLo,color:C.blue}}>{status.loading?(th?'กำลังตรวจ...':'Checking...'):(th?'Run Doctor':'Run Doctor')}</button>
+        </div>
+        {status.error ? <div style={{marginTop:14,color:C.red,fontWeight:800}}>{status.error}</div> : null}
+      </Card>
+
+      {doctor && !doctor.safe_to_import ? (
+        <Card style={{marginBottom:16,border:`1px solid ${C.amber}`}}>
+          <div style={{fontSize:17,fontWeight:950,color:C.amber,marginBottom:10}}>{th?'Migration ที่ควรรัน':'Migrations to run'}</div>
+          <div style={{fontSize:13,color:C.muted,lineHeight:1.8,marginBottom:12}}>
+            {th ? 'รันทีละไฟล์ใน Supabase SQL Editor จาก ZIP เวอร์ชันล่าสุด อย่าวางรวมทั้งหมดในครั้งเดียว' : 'Run one file at a time in Supabase SQL Editor from the latest ZIP. Do not paste all migrations together.'}
+          </div>
+          <div style={{display:'grid',gap:7}}>
+            {migrationList.map((migration) => <code key={migration} style={{display:'block',background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:'8px 10px',color:C.text,fontSize:12}}>{migration}</code>)}
+          </div>
+        </Card>
+      ) : null}
+
+      <Card style={{padding:0,overflow:'hidden'}}>
+        {status.loading ? <div style={{padding:20}}>{th?'กำลังตรวจฐานข้อมูล...':'Checking database...'}</div> : (
+          <div style={{overflowX:'auto'}}>
+            <table style={{width:'100%',borderCollapse:'collapse',fontSize:13,minWidth:1050}}>
+              <thead><tr>{[th?'Check':'Check',th?'สถานะ':'Status',th?'Migration':'Migration',th?'ข้อความ':'Message'].map(h=><th key={h} style={{textAlign:'left',padding:12,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
+              <tbody>{(doctor?.checks || []).map((check) => (
+                <tr key={check.key} style={{borderBottom:`1px solid ${C.border}`}}>
+                  <td style={{padding:12,fontWeight:900,color:C.white}}>{check.label}<div style={{fontSize:11,color:C.muted,marginTop:3}}>{check.key}</div></td>
+                  <td style={{padding:12}}><Badge color={colorFor(check)}>{check.status}</Badge></td>
+                  <td style={{padding:12,color:C.muted,fontFamily:'monospace',fontSize:12}}>{check.migration || '-'}</td>
+                  <td style={{padding:12,color:check.status==='pass'?C.muted:colorFor(check),lineHeight:1.6}}>{check.message || '-'}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+            {!doctor?.checks?.length ? <div style={{padding:20,color:C.muted}}>{th?'ยังไม่มีผลตรวจ':'No diagnostics yet.'}</div> : null}
+          </div>
+        )}
+      </Card>
+
+      <div className="responsive-grid-3" style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:12,marginTop:16}}>
+        <Card style={{padding:16}}><div style={{fontSize:13,fontWeight:900,color:C.green}}>PASS</div><div style={{fontSize:26,fontWeight:950}}>{passChecks.length}</div></Card>
+        <Card style={{padding:16}}><div style={{fontSize:13,fontWeight:900,color:C.amber}}>WARNING</div><div style={{fontSize:26,fontWeight:950}}>{warnChecks.length}</div></Card>
+        <Card style={{padding:16}}><div style={{fontSize:13,fontWeight:900,color:C.red}}>BLOCKING</div><div style={{fontSize:26,fontWeight:950}}>{blockingChecks.length}</div></Card>
+      </div>
+    </div>
+  );
+}
+
+
 function DataQualityPage({ store, companyId, companies = [], lang }) {
   const C = useC();
   const th = lang === "th";
   const [rows, setRows] = useState([]);
   const [validationRows, setValidationRows] = useState([]);
   const [metricRows, setMetricRows] = useState([]);
+  const [mappingRows, setMappingRows] = useState([]);
   const [status, setStatus] = useState({ loading: true, error: "", ok: "" });
   const [busyId, setBusyId] = useState(null);
   const company = companies.find(c => Number(c.id) === Number(companyId)) || COMPANIES.find(c=>Number(c.id)===Number(companyId));
@@ -1694,14 +1960,16 @@ function DataQualityPage({ store, companyId, companies = [], lang }) {
     if (!isSupabaseConfigured) { setStatus({ loading:false, error: th ? "ต้องเชื่อม Supabase ก่อน" : "Supabase is required", ok:"" }); return; }
     setStatus({ loading:true, error:"", ok:"" });
     try {
-      const [readiness, validations, metrics] = await Promise.all([
+      const [readiness, validations, metrics, mappingReview] = await Promise.all([
         loadAccountingReadiness(companyId || null, 300),
         loadValidationResults({ companyId: companyId || null, limit: 500 }),
         loadFinancialMetricSnapshots({ companyId: companyId || null, limit: 2000 }),
+        loadMappingReviewRows(companyId || null, 1000).catch(() => []),
       ]);
       setRows(readiness);
       setValidationRows(validations);
       setMetricRows(metrics);
+      setMappingRows(mappingReview);
       setStatus({ loading:false, error:"", ok:"" });
     } catch (error) {
       setStatus({ loading:false, error:error.message || String(error), ok:"" });
@@ -1732,15 +2000,17 @@ function DataQualityPage({ store, companyId, companies = [], lang }) {
   const readinessColor = (row) => row.export_ready ? C.green : row.dashboard_ready ? C.blue : row.readiness_status === 'mapping_review_required' ? C.amber : C.red;
 
   const latestMetricYears = [...new Set(metricRows.map((m) => m.fiscal_year).filter(Boolean))].sort((a,b)=>b-a).slice(0,5);
+  const mappingConflictSummary = summarizeMappingConflicts(mappingRows.map((row) => analyzeMappingRowSafety(row, row.suggested_account_group || row.account_group).adjusted));
 
   return (
     <div>
       <PageHeader title={th?"คุณภาพข้อมูล / Readiness Gate":"Data Quality / Readiness Gate"} subtitle={th?"Control Room สำหรับตรวจว่า Dashboard และ Export ใช้งานได้หรือยัง":"Control room for Dashboard Ready / Export Ready / External Use readiness"}/>
-      <div className="responsive-grid-3" style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:16}}>
+      <div className="responsive-grid-3" style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:12,marginBottom:16}}>
         <Card><div style={{fontSize:12,color:C.muted,fontWeight:800}}>Readiness Score</div><div style={{fontSize:30,fontWeight:900,color:scoreColor}}>{avgScore}%</div></Card>
         <Card><div style={{fontSize:12,color:C.muted,fontWeight:800}}>Dashboard Ready</div><div style={{fontSize:30,fontWeight:900,color:dashboardReady?C.blue:C.muted}}>{dashboardReady}/{confirmedRows.length}</div></Card>
         <Card><div style={{fontSize:12,color:C.muted,fontWeight:800}}>Export Ready</div><div style={{fontSize:30,fontWeight:900,color:exportReady?C.green:C.muted}}>{exportReady}/{confirmedRows.length}</div></Card>
         <Card><div style={{fontSize:12,color:C.muted,fontWeight:800}}>{th?"Validation Issues":"Validation Issues"}</div><div style={{fontSize:30,fontWeight:900,color:blockingValidation?C.red:warnings?C.amber:C.green}}>{blockingValidation}/{warnings}</div><div style={{fontSize:11,color:C.muted}}>error / warning</div></Card>
+        <Card><div style={{fontSize:12,color:C.muted,fontWeight:800}}>Mapping Conflicts</div><div style={{fontSize:30,fontWeight:900,color:mappingConflictSummary.conflict_count?C.red:C.green}}>{mappingConflictSummary.conflict_count}</div><div style={{fontSize:11,color:C.muted}}>manual {mappingConflictSummary.manual_required_count} / blocked {mappingConflictSummary.blocked_count}</div></Card>
       </div>
 
       <Card style={{marginBottom:16,border:`1px solid ${exportReady===confirmedRows.length && confirmedRows.length ? C.green : C.amber}`}}>
@@ -1797,9 +2067,17 @@ function DataQualityPage({ store, companyId, companies = [], lang }) {
               <div style={{fontSize:16,fontWeight:950,color:C.white,marginBottom:10}}>{th?"Financial Metrics Snapshots":"Financial Metrics Snapshots"}</div>
               <div style={{fontSize:13,color:C.muted,marginBottom:10}}>{th?"ปีล่าสุดที่มี snapshot":"Latest snapshot years"}: {latestMetricYears.join(', ') || '-'}</div>
               <div style={{display:"grid",gap:8,maxHeight:360,overflowY:"auto"}}>
-                {metricRows.slice(0,45).map((m)=><div key={m.id} style={{display:"grid",gridTemplateColumns:"110px 1fr 110px",gap:8,padding:10,borderRadius:10,background:C.bg,border:`1px solid ${C.border}`,fontSize:12}}>
-                  <div style={{fontWeight:900}}>FY {m.fiscal_year}</div><div>{m.metric_key}</div><div style={{textAlign:'right',fontWeight:900}}>{Number(m.metric_value||0).toLocaleString()}</div>
-                </div>)}
+                {metricRows.slice(0,45).map((m)=>{
+                  const sourceCount = Array.isArray(m.source_rows) ? m.source_rows.length : 0;
+                  return <div key={m.id} style={{display:"grid",gridTemplateColumns:"92px 1fr 110px",gap:8,padding:10,borderRadius:10,background:C.bg,border:`1px solid ${C.border}`,fontSize:12}}>
+                    <div style={{fontWeight:900}}>FY {m.fiscal_year}</div>
+                    <div>
+                      <div style={{fontWeight:900}}>{m.metric_key} {m.is_current === false ? <span style={{color:C.muted}}>· old</span> : <span style={{color:C.green}}>· current</span>}</div>
+                      <div style={{color:C.muted,marginTop:3}}>batch {String(m.import_batch_id || '-').slice(0,8)} · rows {sourceCount} · {m.source_type || '-'} · run {String(m.snapshot_run_id || '-').slice(0,8)}</div>
+                    </div>
+                    <div style={{textAlign:'right',fontWeight:900}}>{Number(m.metric_value||0).toLocaleString()}</div>
+                  </div>;
+                })}
                 {!metricRows.length ? <div style={{color:C.muted}}>{th?"ยังไม่มี metrics snapshot":"No metric snapshots yet."}</div> : null}
               </div>
             </Card>
@@ -1854,7 +2132,8 @@ function MappingCenterPage({ companyId, lang, onRefresh }) {
 
   const groupedRows = useMemo(() => groupMappingRows(rows, draftGroups), [rows, draftGroups]);
   const summary = useMemo(() => summarizeMappingGroups(groupedRows), [groupedRows]);
-  const filteredGroups = useMemo(() => groupedRows.filter((group) => riskFilter === 'all' || group.risk_level === riskFilter || (riskFilter === 'safe' && group.safe_to_bulk_confirm)), [groupedRows, riskFilter]);
+  const conflictSummary = useMemo(() => summarizeMappingConflicts(rows.map((row) => analyzeMappingRowSafety(row, draftGroups[row.id] || row.suggested_account_group || row.account_group).adjusted)), [rows, draftGroups]);
+  const filteredGroups = useMemo(() => groupedRows.filter((group) => riskFilter === 'all' || group.risk_level === riskFilter || (riskFilter === 'safe' && group.safe_to_bulk_confirm) || (riskFilter === 'conflict' && (group.conflict_count > 0 || group.conflict_status !== 'none')) || (riskFilter === 'manual' && (group.manual_required_count > 0 || group.approval_policy === 'manual_required')) || (riskFilter === 'blocked' && (group.blocked_count > 0 || group.approval_policy === 'blocked'))), [groupedRows, riskFilter]);
   const selectedGroups = filteredGroups.filter((group) => selectedGroupKeys[group.key]);
 
   const sourceLabel = (source) => ({
@@ -1874,6 +2153,29 @@ function MappingCenterPage({ companyId, lang, onRefresh }) {
   const riskColor = (risk) => ({ low: C.green, medium: C.amber, high: C.red }[risk] || C.muted);
   const roleColor = (role) => ({ detail: C.green, total: C.amber, grand_total: C.amber, subtotal: C.amber, oci: C.purple, disclosure: C.muted, movement: C.blue, attribution: C.purple }[role] || C.muted);
   const statusColor = (statusValue) => ({ approved: C.green, suggested: C.amber, needs_manual_review: C.red, blocked: C.red, draft_edited: C.blue }[statusValue] || C.muted);
+  const conflictColor = (statusValue, policyValue) => {
+    if (policyValue === 'blocked' || statusValue === 'blocked' || statusValue === 'confirmed_conflict') return C.red;
+    if (policyValue === 'manual_required' || statusValue === 'manual_required' || statusValue === 'high_risk_term') return C.amber;
+    if (statusValue === 'potential_conflict') return C.purple;
+    return C.green;
+  };
+  const conflictLabel = (statusValue, policyValue) => {
+    if (policyValue === 'safe_auto' && (!statusValue || statusValue === 'none')) return 'Safe Auto';
+    if (policyValue === 'blocked' || statusValue === 'blocked') return 'Blocked';
+    if (statusValue === 'confirmed_conflict') return 'Conflict';
+    if (policyValue === 'manual_required' || statusValue === 'manual_required' || statusValue === 'high_risk_term') return 'Manual Required';
+    if (statusValue === 'potential_conflict') return 'Potential Conflict';
+    return policyValue || statusValue || 'Review';
+  };
+  const getApprovalReason = (safety, subjectLabel = '') => {
+    if (!safety.requiresManualReason && !['manual_required','blocked','row_only_manual'].includes(safety.approvalPolicy)) return '';
+    const promptText = th
+      ? `รายการนี้มีความเสี่ยง/Conflict: ${subjectLabel}\nเหตุผล: ${(safety.conflictReasons || []).join(', ') || safety.reason}\n\nกรุณาระบุเหตุผลการอนุมัติ Mapping นี้:`
+      : `This mapping is risky/conflicting: ${subjectLabel}\nReason: ${(safety.conflictReasons || []).join(', ') || safety.reason}\n\nEnter the manual approval reason:`;
+    const reason = window.prompt(promptText, '');
+    if (!String(reason || '').trim()) return null;
+    return String(reason).trim();
+  };
 
   const applyDraftToGroup = (group, nextGroup) => {
     const next = { ...draftGroups };
@@ -1885,6 +2187,8 @@ function MappingCenterPage({ companyId, lang, onRefresh }) {
     const group = draftGroups[row.id] || row.suggested_account_group || row.account_group || 'other';
     const safety = analyzeMappingRowSafety(row, group);
     const subgroup = row.suggested_account_subgroup || row.account_subgroup || safety.adjusted.account_subgroup || detectAccountSubgroup(row.raw_account_name || row.account_name, group) || group;
+    const approvalReason = getApprovalReason(safety, row.raw_account_name || row.account_name);
+    if (approvalReason === null) return;
     setSavingId(row.id);
     try {
       await updateMappingForRawAccount({
@@ -1897,6 +2201,9 @@ function MappingCenterPage({ companyId, lang, onRefresh }) {
         accountingStandardProfile: row.accounting_standard_profile || null,
         lineRole: safety.lineRole || row.line_role || null,
         approvalScope: 'single_row',
+        normalizedFinancialDataId: row.id || null,
+        importBatchId: row.import_batch_id || null,
+        approvalReason,
       });
       await load(); await onRefresh?.();
     } catch (error) { alert(error.message); }
@@ -1904,12 +2211,46 @@ function MappingCenterPage({ companyId, lang, onRefresh }) {
   };
 
   const saveGroup = async (group) => {
+    const manual = !group.safe_to_bulk_confirm;
+    const message = manual
+      ? (th
+        ? `กลุ่มนี้ไม่เข้าเกณฑ์ safe (${group.risk_level}). จะบันทึกเป็น Manual / Row-only approval และไม่เอาไปจำใช้กับไฟล์อนาคตอัตโนมัติ\nต้องการยืนยัน ${group.row_count} แถวหรือไม่?`
+        : `This group is not safe (${group.risk_level}). It will be saved as manual / row-only approval and will not be auto-reused for future imports.\nConfirm ${group.row_count} rows?`)
+      : (th ? `Confirm group นี้ ${group.row_count} แถวหรือไม่?` : `Confirm this group (${group.row_count} rows)?`);
+    if (!window.confirm(message)) return;
+    let groupApprovalReason = '';
+    if (manual) {
+      const worstSafety = group.rows.map((row) => analyzeMappingRowSafety(row, draftGroups[row.id] || group.selected_group)).find((s) => s.requiresManualReason || s.approvalPolicy !== 'safe_auto') || analyzeMappingRowSafety(group.rows[0] || {}, group.selected_group);
+      groupApprovalReason = getApprovalReason(worstSafety, group.raw_account_name);
+      if (groupApprovalReason === null) return;
+    }
     setSavingId(group.key);
     try {
-      for (const row of group.rows) await save(row);
-    } finally {
-      setSavingId(null);
-    }
+      const affectedBatchIds = [...new Set(group.rows.map(row => row.import_batch_id).filter(Boolean))];
+      for (const row of group.rows) {
+        const selectedGroup = draftGroups[row.id] || group.selected_group || row.suggested_account_group || row.account_group || 'other';
+        const safety = analyzeMappingRowSafety(row, selectedGroup);
+        const subgroup = row.suggested_account_subgroup || row.account_subgroup || safety.adjusted.account_subgroup || detectAccountSubgroup(row.raw_account_name || row.account_name, selectedGroup) || selectedGroup;
+        await updateMappingForRawAccount({
+          companyId: row.company_id,
+          rawAccountName: row.raw_account_name,
+          statementType: row.statement_type,
+          accountGroup: selectedGroup,
+          accountSubgroup: subgroup,
+          statementScope: row.statement_scope || null,
+          accountingStandardProfile: row.accounting_standard_profile || null,
+          lineRole: safety.lineRole || row.line_role || null,
+          approvalScope: manual ? 'manual_group_review' : 'safe_group_confirm',
+          normalizedFinancialDataId: row.id || null,
+          importBatchId: row.import_batch_id || null,
+          skipReadinessRebuild: true,
+          approvalReason: manual ? groupApprovalReason : '',
+        });
+      }
+      for (const id of affectedBatchIds) await rebuildAccountingReadiness({ companyId, batchId: id, strictAnnual: true });
+      await load(); await onRefresh?.();
+    } catch (error) { alert(error.message); }
+    finally { setSavingId(null); }
   };
 
   const confirmSafe = async () => {
@@ -1948,15 +2289,16 @@ function MappingCenterPage({ companyId, lang, onRefresh }) {
       <Card style={{padding:16,marginBottom:16,border:`1px solid ${C.amber}`}}>
         <div style={{fontWeight:900,color:C.amber,marginBottom:6}}>⚠ {th ? "หลักความปลอดภัยของ Mapping" : "Mapping safety rule"}</div>
         <div style={{color:C.muted,fontSize:13,lineHeight:1.6}}>
-          {th ? "ระบบจะ group รายการซ้ำหลายปีให้ และอนุญาต Bulk Confirm เฉพาะรายการ detail ที่ confidence สูงและไม่มี risk flag เท่านั้น รายการ total/subtotal, OCI, NCI, goodwill, business combination, Other และ critical review ต้องตรวจเอง" : "Rows are grouped across years. Bulk approval is allowed only for high-confidence detail lines with no risk flags. Total/subtotal, OCI, NCI, goodwill, business combination, Other, and critical review rows remain manual."}
+          {th ? "Bulk Confirm จะทำเฉพาะ safe_auto เท่านั้น รายการ OCI / NCI / Goodwill / Fair value / Deferred tax / Total/Subtotal / Conflict ต้องตรวจเองและกรอกเหตุผลก่อนอนุมัติ" : "Bulk Confirm only approves safe_auto rows. OCI / NCI / Goodwill / Fair value / Deferred tax / Total/Subtotal / Conflict rows require manual review and an approval reason."}
         </div>
       </Card>
 
-      <div style={{display:'grid',gridTemplateColumns:'repeat(5,minmax(120px,1fr))',gap:12,marginBottom:16}}>
+      <div style={{display:'grid',gridTemplateColumns:'repeat(6,minmax(120px,1fr))',gap:12,marginBottom:16}}>
         <Card style={{padding:14}}><div style={{color:C.muted,fontSize:12}}>Groups</div><div style={{fontSize:24,fontWeight:900}}>{summary.total_groups}</div></Card>
-        <Card style={{padding:14}}><div style={{color:C.muted,fontSize:12}}>Safe rows</div><div style={{fontSize:24,fontWeight:900,color:C.green}}>{summary.safe_rows}</div></Card>
-        <Card style={{padding:14}}><div style={{color:C.muted,fontSize:12}}>Safe groups</div><div style={{fontSize:24,fontWeight:900,color:C.green}}>{summary.safe_groups}</div></Card>
-        <Card style={{padding:14}}><div style={{color:C.muted,fontSize:12}}>Medium risk</div><div style={{fontSize:24,fontWeight:900,color:C.amber}}>{summary.medium_risk_groups}</div></Card>
+        <Card style={{padding:14}}><div style={{color:C.muted,fontSize:12}}>Safe Auto</div><div style={{fontSize:24,fontWeight:900,color:C.green}}>{summary.safe_rows}</div></Card>
+        <Card style={{padding:14}}><div style={{color:C.muted,fontSize:12}}>Conflicts</div><div style={{fontSize:24,fontWeight:900,color:conflictSummary.conflict_count?C.red:C.green}}>{conflictSummary.conflict_count}</div></Card>
+        <Card style={{padding:14}}><div style={{color:C.muted,fontSize:12}}>Manual</div><div style={{fontSize:24,fontWeight:900,color:conflictSummary.manual_required_count?C.amber:C.green}}>{conflictSummary.manual_required_count}</div></Card>
+        <Card style={{padding:14}}><div style={{color:C.muted,fontSize:12}}>Blocked</div><div style={{fontSize:24,fontWeight:900,color:conflictSummary.blocked_count?C.red:C.green}}>{conflictSummary.blocked_count}</div></Card>
         <Card style={{padding:14}}><div style={{color:C.muted,fontSize:12}}>High risk</div><div style={{fontSize:24,fontWeight:900,color:C.red}}>{summary.high_risk_groups}</div></Card>
       </div>
 
@@ -1964,16 +2306,35 @@ function MappingCenterPage({ companyId, lang, onRefresh }) {
         <button onClick={confirmSafe} disabled={bulkSaving || summary.safe_rows === 0} style={{background:C.green,color:'#06130F',border:0,borderRadius:10,padding:'10px 14px',fontWeight:900,cursor:'pointer'}}>{bulkSaving ? (th?'กำลังบันทึก...':'Saving...') : (th?'✅ Confirm Safe Suggestions':'✅ Confirm Safe Suggestions')}</button>
         <button onClick={confirmSelected} disabled={bulkSaving || selectedGroups.length === 0} style={{background:C.accent,color:'#fff',border:0,borderRadius:10,padding:'10px 14px',fontWeight:900,cursor:'pointer'}}>{th?'☑ Confirm Selected Safe':'☑ Confirm Selected Safe'}</button>
         <button onClick={()=>setViewMode(viewMode === 'groups' ? 'rows' : 'groups')} style={{background:C.card,color:C.text,border:`1px solid ${C.border}`,borderRadius:10,padding:'10px 14px',fontWeight:900,cursor:'pointer'}}>{viewMode === 'groups' ? (th?'ดูรายแถว':'Row view') : (th?'ดูแบบกลุ่ม':'Group view')}</button>
+        <button onClick={()=>setViewMode(viewMode === 'conflicts' ? 'groups' : 'conflicts')} style={{background:viewMode==='conflicts'?C.redLo:C.card,color:viewMode==='conflicts'?C.red:C.text,border:`1px solid ${viewMode==='conflicts'?C.red:C.border}`,borderRadius:10,padding:'10px 14px',fontWeight:900,cursor:'pointer'}}>{th?'Mapping Conflict Center':'Mapping Conflict Center'}</button>
         <select value={riskFilter} onChange={(e)=>setRiskFilter(e.target.value)} style={{background:C.bg,color:C.text,border:`1px solid ${C.border}`,borderRadius:10,padding:'10px 14px',fontWeight:800}}>
-          <option value="all">All risk</option><option value="safe">Safe only</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option>
+          <option value="all">All risk</option><option value="safe">Safe only</option><option value="conflict">Conflict</option><option value="manual">Manual Required</option><option value="blocked">Blocked</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option>
         </select>
       </Card>
 
       <Card style={{padding:0,overflow:"hidden"}}>
-        {status.loading ? <div style={{padding:20}}>{th?"กำลังโหลด...":"Loading..."}</div> : status.error ? <div style={{padding:20,color:C.red}}>{status.error}</div> : rows.length === 0 ? <div style={{padding:24,textAlign:"center",color:C.green,fontWeight:900}}>{th?"ไม่มีรายการที่ต้องแก้ไข":"No mapping issues found"}</div> : viewMode === 'groups' ? (
+        {status.loading ? <div style={{padding:20}}>{th?"กำลังโหลด...":"Loading..."}</div> : status.error ? <div style={{padding:20,color:C.red}}>{status.error}</div> : rows.length === 0 ? <div style={{padding:24,textAlign:"center",color:C.green,fontWeight:900}}>{th?"ไม่มีรายการที่ต้องแก้ไข":"No mapping issues found"}</div> : viewMode === 'conflicts' ? (
+          <div style={{overflowX:'auto'}}>
+            <table style={{width:'100%',borderCollapse:'collapse',fontSize:13,minWidth:1450}}>
+              <thead><tr>{[th?'บัญชี':'Account',th?'ปี':'Year',th?'งบ':'Statement','Current / Suggested','Conflict','Reason',th?'ไฟล์':'File',th?'Action':'Action'].map(h=><th key={h} style={{textAlign:'left',padding:11,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
+              <tbody>{rows.map(row => ({row, selectedGroup: draftGroups[row.id] || row.suggested_account_group || row.account_group || 'other'})).map(({row, selectedGroup}) => ({ row, selectedGroup, safety: analyzeMappingRowSafety(row, selectedGroup) })).filter(({safety}) => safety.conflictStatus !== 'none' || ['manual_required','blocked','row_only_manual'].includes(safety.approvalPolicy)).map(({row, selectedGroup, safety}) => (
+                <tr key={row.id} style={{borderBottom:`1px solid ${C.border}`,background:safety.approvalPolicy==='blocked'?C.redLo:C.amberLo}}>
+                  <td style={{padding:11,fontWeight:900,maxWidth:320}}>{row.raw_account_name}<div style={{fontSize:11,color:C.muted,marginTop:4}}>{row.companies?.ticker_symbol || row.company_id}</div></td>
+                  <td style={{padding:11}}>{row.fiscal_year}</td>
+                  <td style={{padding:11,color:C.muted}}>{row.statement_type}<div style={{fontSize:11}}>{row.statement_scope || '-'}</div></td>
+                  <td style={{padding:11}}>{row.account_group || '-'} → <b>{selectedGroup}</b></td>
+                  <td style={{padding:11}}><Badge color={conflictColor(safety.conflictStatus, safety.approvalPolicy)}>{conflictLabel(safety.conflictStatus, safety.approvalPolicy)}</Badge></td>
+                  <td style={{padding:11,maxWidth:360}}><div>{(safety.conflictReasons || []).join(', ') || safety.reason}</div>{row.manual_approval_reason ? <div style={{fontSize:11,color:C.green,marginTop:4}}>Reason: {row.manual_approval_reason}</div> : null}</td>
+                  <td style={{padding:11,color:C.muted}}>{row.source_file || '-'}<div style={{fontSize:11}}>{row.source_sheet || ''} #{row.source_row || ''}</div></td>
+                  <td style={{padding:11}}><button disabled={savingId===row.id} onClick={()=>save(row)} style={{background:C.amber,color:'#1a1200',border:0,borderRadius:8,padding:'8px 12px',fontWeight:900,cursor:'pointer'}}>{th?'Approve Row Only':'Approve Row Only'}</button></td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        ) : viewMode === 'groups' ? (
           <div style={{overflowX:"auto"}}>
             <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:1500}}>
-              <thead><tr>{['', th?'บัญชี / Group':'Account / Group', th?'ปี':'Years', th?'งบ':'Statement', 'Line role', 'Risk', 'Confidence', 'Standard', th?'Suggested category':'Suggested category', th?'Action':'Action'].map(h=><th key={h} style={{textAlign:"left",padding:11,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
+              <thead><tr>{['', th?'บัญชี / Group':'Account / Group', th?'ปี':'Years', th?'งบ':'Statement', 'Line role', 'Risk', 'Conflict', 'Confidence', 'Standard', th?'Suggested category':'Suggested category', th?'Action':'Action'].map(h=><th key={h} style={{textAlign:"left",padding:11,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
               <tbody>{filteredGroups.map(group => <tr key={group.key} style={{borderBottom:`1px solid ${C.border}`,background:group.safe_to_bulk_confirm ? 'transparent' : (group.risk_level === 'high' ? C.redLo : C.amberLo)}}>
                 <td style={{padding:11}}><input type="checkbox" checked={Boolean(selectedGroupKeys[group.key])} onChange={(e)=>setSelectedGroupKeys(prev=>({...prev,[group.key]:e.target.checked}))}/></td>
                 <td style={{padding:11,fontWeight:800,maxWidth:360}}>
@@ -1985,6 +2346,7 @@ function MappingCenterPage({ companyId, lang, onRefresh }) {
                 <td style={{padding:11,color:C.muted}}>{group.statement_type}<div style={{fontSize:11}}>{group.statement_scope}</div></td>
                 <td style={{padding:11}}><Badge color={roleColor(group.line_role)}>{group.line_role}</Badge></td>
                 <td style={{padding:11}}><Badge color={riskColor(group.risk_level)}>{group.safe_to_bulk_confirm ? 'safe' : group.risk_level}</Badge></td>
+                <td style={{padding:11}}><Badge color={conflictColor(group.conflict_status, group.approval_policy)}>{conflictLabel(group.conflict_status, group.approval_policy)}</Badge>{group.conflict_reasons?.length ? <div style={{fontSize:10,color:C.muted,marginTop:4}}>{group.conflict_reasons.slice(0,2).join(', ')}</div> : null}</td>
                 <td style={{padding:11,color:group.avg_confidence>=0.9?C.green:C.amber}}>{group.avg_confidence}</td>
                 <td style={{padding:11,maxWidth:260}}>
                   <div>{group.standard_ref || '-'}</div>
@@ -1996,7 +2358,7 @@ function MappingCenterPage({ companyId, lang, onRefresh }) {
                   </select>
                 </td>
                 <td style={{padding:11}}>
-                  <button disabled={savingId===group.key || !group.safe_to_bulk_confirm} onClick={()=>saveGroup(group)} style={{background:group.safe_to_bulk_confirm?C.green:C.border,color:group.safe_to_bulk_confirm?'#06130F':C.muted,border:0,borderRadius:8,padding:'8px 12px',fontWeight:900,cursor:group.safe_to_bulk_confirm?'pointer':'not-allowed'}}>{group.safe_to_bulk_confirm ? (th?'Confirm Group':'Confirm Group') : (th?'Manual':'Manual')}</button>
+                  <button disabled={savingId===group.key} onClick={()=>saveGroup(group)} style={{background:group.safe_to_bulk_confirm?C.green:C.amber,color:group.safe_to_bulk_confirm?'#06130F':'#1a1200',border:0,borderRadius:8,padding:'8px 12px',fontWeight:900,cursor:'pointer'}}>{group.safe_to_bulk_confirm ? (th?'Confirm Group':'Confirm Group') : (th?'Manual Confirm':'Manual Confirm')}</button>
                 </td>
               </tr>)}</tbody>
             </table>
@@ -2004,7 +2366,7 @@ function MappingCenterPage({ companyId, lang, onRefresh }) {
         ) : (
           <div style={{overflowX:"auto"}}>
             <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:1450}}>
-              <thead><tr>{[th?"สถานะ":"Status",th?"บริษัท":"Company",th?"ปี":"Year",th?"งบ":"Statement",th?"ชื่อบัญชีจากไฟล์":"Raw account",'Line role','Risk',th?"Source":"Source",th?"Confidence":"Confidence",th?"AI/Suggested category":"AI/Suggested category",th?"Confirm":"Confirm"].map(h=><th key={h} style={{textAlign:"left",padding:11,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
+              <thead><tr>{[th?"สถานะ":"Status",th?"บริษัท":"Company",th?"ปี":"Year",th?"งบ":"Statement",th?"ชื่อบัญชีจากไฟล์":"Raw account",'Line role','Risk','Conflict',th?"Source":"Source",th?"Confidence":"Confidence",th?"AI/Suggested category":"AI/Suggested category",th?"Confirm":"Confirm"].map(h=><th key={h} style={{textAlign:"left",padding:11,color:C.muted,borderBottom:`1px solid ${C.border}`}}>{h}</th>)}</tr></thead>
               <tbody>{rows.map(row => {
                 const selectedGroup = draftGroups[row.id] || row.suggested_account_group || row.account_group || 'other';
                 const safety = analyzeMappingRowSafety(row, selectedGroup);
@@ -2017,6 +2379,7 @@ function MappingCenterPage({ companyId, lang, onRefresh }) {
                   <td style={{padding:11,fontWeight:700,maxWidth:320}}><div>{row.raw_account_name}</div>{safety.reason ? <div style={{color:C.muted,fontSize:11,marginTop:4}}>{safety.reason}</div> : null}</td>
                   <td style={{padding:11}}><Badge color={roleColor(safety.lineRole)}>{safety.lineRole}</Badge></td>
                   <td style={{padding:11}}><Badge color={riskColor(safety.riskLevel)}>{safety.safe ? 'safe' : safety.riskLevel}</Badge></td>
+                  <td style={{padding:11}}><Badge color={conflictColor(safety.conflictStatus, safety.approvalPolicy)}>{conflictLabel(safety.conflictStatus, safety.approvalPolicy)}</Badge></td>
                   <td style={{padding:11}}><Badge color={sourceColor(row.mapping_source)}>{sourceLabel(row.mapping_source)}</Badge></td>
                   <td style={{padding:11,color:(Number(row.mapping_confidence)||0) >= 0.9 ? C.green : C.amber}}>{row.mapping_confidence ?? '-'}</td>
                   <td style={{padding:11}}><select disabled={savingId===row.id} value={selectedGroup} onChange={(e)=>setDraftGroups(prev=>({...prev,[row.id]:e.target.value}))} style={{background:C.bg,border:`1px solid ${safety.safe ? C.border : C.amber}`,color:C.text,borderRadius:8,padding:"8px 10px",minWidth:220}}>{groupOptions.map(g=><option key={g} value={g}>{g}</option>)}</select></td>
@@ -2473,6 +2836,8 @@ const NAV = [
   {id:"slides", icon:"🖥", th:"Slide Template", en:"Slide Template"},
   {id:"access", icon:"🔐", th:"สิทธิ์ผู้ใช้", en:"Access"},
   {id:"imports", icon:"🧭", th:"ประวัตินำเข้า", en:"Import History"},
+  {id:"importJobs", icon:"🛠", th:"งานนำเข้า", en:"Import Jobs"},
+  {id:"systemDoctor", icon:"🩺", th:"System Doctor", en:"System Doctor"},
   {id:"quality", icon:"✅", th:"คุณภาพข้อมูล", en:"Data Quality"},
   {id:"mapping", icon:"🧩", th:"Mapping", en:"Mapping"},
   {id:"alerts", icon:"🔔", th:"แจ้งเตือน", en:"Alerts"},
@@ -2768,6 +3133,8 @@ export default function App() {
     if (page==="slides") return <SlideViewer store={store} companyId={companyId} year={year} lang={lang} theme={theme} onImportSuccess={handleUpsert} onGoUpload={()=>setPage("upload")}/>;
     if (page==="access") return <AccessPage companyId={companyId} lang={lang}/>;
     if (page==="imports") return <ImportHistoryPage companyId={companyId} companies={companies} onRefresh={refreshRemoteData} onOpenDashboard={(row)=>{ setPage('momentum'); handleDashboardSnapshotChange({ batchId: row.id, companyId: row.company_id, fiscalYear: row.fiscal_year }); }} lang={lang}/>;
+    if (page==="importJobs") return <ImportJobsPage companyId={companyId} companies={companies} onRefresh={refreshRemoteData} onOpenImportHistory={()=>setPage('imports')} lang={lang}/>;
+    if (page==="systemDoctor") return <SystemDoctorPage lang={lang}/>;
     if (page==="quality") return <DataQualityPage store={store} companyId={companyId} companies={companies} lang={lang}/>;
     if (page==="mapping") return <MappingCenterPage companyId={companyId} lang={lang} onRefresh={refreshRemoteData}/>;
     if (page==="alerts") return <AlertCenterPage companyId={companyId} companies={companies} lang={lang}/>;

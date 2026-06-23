@@ -49,7 +49,7 @@ create index if not exists idx_account_mappings_risk_flags_gin
 create table if not exists public.mapping_decisions (
   id bigserial primary key,
   company_id bigint not null references public.companies(id) on delete cascade,
-  normalized_financial_data_id bigint references public.normalized_financial_data(id) on delete set null,
+  normalized_financial_data_id uuid references public.normalized_financial_data(id) on delete set null,
   import_batch_id uuid references public.import_batches(id) on delete set null,
   raw_account_name text not null,
   normalized_account_name text,
@@ -90,6 +90,37 @@ create index if not exists idx_mapping_decisions_company_lookup
   on public.mapping_decisions(company_id, normalized_account_name, statement_type, statement_scope, accounting_standard_profile, approved_at desc);
 create index if not exists idx_mapping_decisions_batch
   on public.mapping_decisions(import_batch_id);
+
+-- v1.9.1.1 hotfix: normalized_financial_data.id is uuid in the base schema.
+-- Some earlier v1.9.0 migration drafts used bigint for normalized_financial_data_id,
+-- which fails with FK type mismatch. Repair only this new ledger column if needed.
+do $$ begin
+  if exists (
+    select 1
+    from information_schema.columns
+    where table_schema = 'public'
+      and table_name = 'mapping_decisions'
+      and column_name = 'normalized_financial_data_id'
+      and data_type <> 'uuid'
+  ) then
+    alter table public.mapping_decisions drop column normalized_financial_data_id;
+    alter table public.mapping_decisions add column normalized_financial_data_id uuid;
+  end if;
+end $$;
+
+do $$ begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'mapping_decisions_normalized_financial_data_id_fkey'
+  ) then
+    alter table public.mapping_decisions
+      add constraint mapping_decisions_normalized_financial_data_id_fkey
+      foreign key (normalized_financial_data_id)
+      references public.normalized_financial_data(id)
+      on delete set null;
+  end if;
+end $$;
 
 -- 4) Store validation results so Dashboard/Data Quality/Export use the same gates.
 create table if not exists public.validation_results (
